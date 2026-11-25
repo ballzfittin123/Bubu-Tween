@@ -1,165 +1,725 @@
--- ═══════════════════════════════════════════════════════════════
--- Bee Swarm Simulator – Auto Fast Tween to Specific Asset
--- (fully automatic + bounding box with infinite Y)
--- ═══════════════════════════════════════════════════════════════
+--=============================================================
+--  Common Token Tween Script
+--  LocalScript -> StarterPlayer > StarterPlayerScripts
+--  Event-driven scanning + tween-once + token-type multi-select.
+--=============================================================
 
-local Players      = game:GetService("Players")
-local TweenService = game:GetService("TweenService")
+local Players          = game:GetService("Players")
+local TweenService     = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
 
 local LocalPlayer = Players.LocalPlayer
+local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
 
--- ──────────────────────────────────────────────────────────────
--- Configuration
--- ──────────────────────────────────────────────────────────────
-local TARGET_ASSET_ID = "rbxassetid://1952740625"
-local TWEEN_TIME      = 0.1      -- seconds per tween (ultra-fast)
-local HOVER_HEIGHT    = 3        -- studs above the token
-local SEARCH_FOLDERS  = {"Collectibles", "Tokens"}
-local POLL_INTERVAL   = 0.1      -- seconds between scans
+--=============================================================
+-- CONFIG
+--=============================================================
+local TOKEN_IDS = {
+    [2028453802] = "Blueberry",
+    [1952740625] = "Strawberry",
+    [1952682401] = "Sunflower Seed",
+    [1952796032] = "Pineapple",
+}
+local TOKEN_ORDER = { 2028453802, 1952740625, 1952682401, 1952796032 }
 
--- Bounding box (Y is infinite → any height)
-local BOUND_CENTER   = Vector3.new(-178.1749725341797, 18.132238388061523, -9.854988098144531)
-local BOUND_HALF_X   = 89.64999389648438  / 2
-local BOUND_HALF_Z   = 106.29002380371094 / 2
+local FIELDS = {
+    ["Sunflower"]  = { Vector2.new(-255, 246),  Vector2.new(-167, 103) },
+    ["Strawberry"] = { Vector2.new(-223, -63),  Vector2.new(-132, 44)  },
+    ["Pine tree"]  = { Vector2.new(-375, -254), Vector2.new(-277, -122)},
+    ["Coconut"]    = { Vector2.new(-316, 513),  Vector2.new(-191, 417) },
+    ["Pepper"]     = { Vector2.new(-539, 472),  Vector2.new(-443, 595) },
+    ["Pineapple"]  = { Vector2.new(190, -165),  Vector2.new(318, -255) },
+}
+local FIELD_ORDER = { "Sunflower", "Strawberry", "Pine tree", "Coconut", "Pepper", "Pineapple" }
 
-local function isInBounds(position)
-    return math.abs(position.X - BOUND_CENTER.X) <= BOUND_HALF_X
-       and math.abs(position.Z - BOUND_CENTER.Z) <= BOUND_HALF_Z
-    -- Y is intentionally ignored → "any y height"
+local SEARCH_FOLDERS       = { "Collectibles", "Tokens" }
+local MIN_TWEEN, MAX_TWEEN = 0.05, 0.30
+local INITIAL_SCAN_DELAY   = 1.0
+local POLL_INTERVAL        = 0.1
+
+--=============================================================
+-- STATE
+--=============================================================
+local state = {
+    running   = false,
+    tweenTime = 0.10,
+    field     = "Sunflower",
+    minimized = false,
+}
+
+-- Per-token-type selection (true = allowed). Defaults to all enabled.
+local selectedTokens = {}
+for _, id in ipairs(TOKEN_ORDER) do
+    selectedTokens[id] = true
 end
 
--- ──────────────────────────────────────────────────────────────
--- Weak-keyed skip set:
---   • every token present at startup (initial scan)
---   • every token already targeted by the loop
--- Entries auto-clean when the token is destroyed.
--- ──────────────────────────────────────────────────────────────
-local skipTokens = setmetatable({}, {__mode = "k"})
+local currentTween    = nil
+local exclusionsReady = false
 
--- ──────────────────────────────────────────────────────────────
--- Helpers
--- ──────────────────────────────────────────────────────────────
+-- Never-tween set (initial snapshot + consumed). Weak-keyed so a
+-- destroyed instance's entry auto-clears and a respawned one is eligible.
+local skipTokens = setmetatable({}, { __mode = "k" })
 
-local function getCharacter()
-    local char = LocalPlayer.Character
-    if not char then return nil end
-    local root = char:FindFirstChild("HumanoidRootPart")
-    if not root then return nil end
-    local humanoid = char:FindFirstChildOfClass("Humanoid")
-    if not humanoid then return nil end
-    return char, root, humanoid
+-- Live tracked tokens: [BasePart] = tokenId
+local activeTokens = {}
+
+--=============================================================
+-- UTILITIES
+--=============================================================
+local function new(class, props, parent)
+    local inst = Instance.new(class)
+    for k, v in pairs(props) do inst[k] = v end
+    if parent then inst.Parent = parent end
+    return inst
 end
 
-local function hasTargetAsset(part)
-    if part:IsA("MeshPart") and part.MeshId == TARGET_ASSET_ID then
-        return true
+local function assetIdOf(str)
+    if type(str) ~= "string" then return nil end
+    local digits = str:match("%d+")
+    return digits and tonumber(digits) or nil
+end
+
+local function fieldBounds(name)
+    local a, b = FIELDS[name][1], FIELDS[name][2]
+    return {
+        minX = math.min(a.X, b.X), maxX = math.max(a.X, b.X),
+        minZ = math.min(a.Y, b.Y), maxZ = math.max(a.Y, b.Y),
+    }
+end
+
+--=============================================================
+-- TOKEN DETECTION  (returns matching tokenId, or nil)
+--=============================================================
+local function getTokenId(part)
+    if not part or not part:IsA("BasePart") then return nil end
+
+    if part:IsA("MeshPart") then
+        local mid = assetIdOf(part.MeshId)
+        if mid and TOKEN_IDS[mid] then return mid end
+        local tid = assetIdOf(part.TextureID)
+        if tid and TOKEN_IDS[tid] then return tid end
     end
-    local texture = part:FindFirstChildOfClass("Texture")
-    if texture and texture.Texture == TARGET_ASSET_ID then
-        return true
-    end
+
     local decal = part:FindFirstChildOfClass("Decal")
-    if decal and decal.Texture == TARGET_ASSET_ID then
-        return true
+    if decal then
+        local id = assetIdOf(decal.Texture)
+        if id and TOKEN_IDS[id] then return id end
     end
-    local specialMesh = part:FindFirstChildOfClass("SpecialMesh")
-    if specialMesh and specialMesh.MeshId == TARGET_ASSET_ID then
-        return true
+
+    local tex = part:FindFirstChildOfClass("Texture")
+    if tex then
+        local id = assetIdOf(tex.Texture)
+        if id and TOKEN_IDS[id] then return id end
     end
-    return false
+
+    local sm = part:FindFirstChildOfClass("SpecialMesh")
+    if sm then
+        local mid = assetIdOf(sm.MeshId)
+        if mid and TOKEN_IDS[mid] then return mid end
+        local tid = assetIdOf(sm.TextureId)
+        if tid and TOKEN_IDS[tid] then return tid end
+    end
+
+    return nil
 end
 
--- Decide where to scan (once at startup)
+--=============================================================
+-- GUI
+--=============================================================
+local gui = new("ScreenGui", {
+    Name = "CommonTokenTweener",
+    ResetOnSpawn = false,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, PlayerGui)
+
+local main = new("Frame", {
+    Size = UDim2.fromOffset(240, 220),
+    Position = UDim2.new(0, 40, 0, 100),
+    BackgroundColor3 = Color3.fromRGB(28, 28, 34),
+    BorderSizePixel = 0,
+}, gui)
+new("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
+new("UIStroke", { Color = Color3.fromRGB(70, 70, 84), Thickness = 1 }, main)
+
+local titleBar = new("Frame", {
+    Size = UDim2.new(1, 0, 0, 28),
+    BackgroundColor3 = Color3.fromRGB(42, 42, 52),
+    BorderSizePixel = 0,
+}, main)
+new("UICorner", { CornerRadius = UDim.new(0, 10) }, titleBar)
+
+new("TextLabel", {
+    Size = UDim2.new(1, -50, 1, 0),
+    Position = UDim2.fromOffset(10, 0),
+    BackgroundTransparency = 1,
+    Text = "Common Token Tween Script",
+    TextColor3 = Color3.fromRGB(235, 235, 245),
+    TextSize = 13,
+    Font = Enum.Font.GothamBold,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, titleBar)
+
+local minBtn = new("TextButton", {
+    Size = UDim2.fromOffset(22, 22),
+    Position = UDim2.new(1, -26, 0, 3),
+    BackgroundTransparency = 1,
+    Text = "–",
+    TextColor3 = Color3.fromRGB(200, 200, 210),
+    TextSize = 16,
+    Font = Enum.Font.GothamBold,
+    AutoButtonColor = false,
+}, titleBar)
+
+local miniBtn = new("TextButton", {
+    Size = UDim2.fromOffset(44, 44),
+    Position = main.Position,
+    BackgroundColor3 = Color3.fromRGB(42, 42, 52),
+    Text = "CT",
+    TextColor3 = Color3.fromRGB(235, 235, 245),
+    TextSize = 14,
+    Font = Enum.Font.GothamBold,
+    AutoButtonColor = false,
+    BorderSizePixel = 0,
+    Visible = false,
+}, gui)
+new("UICorner", { CornerRadius = UDim.new(1, 0) }, miniBtn)
+new("UIStroke", { Color = Color3.fromRGB(90, 160, 255), Thickness = 1 }, miniBtn)
+
+-- Main Switch
+new("TextLabel", {
+    Size = UDim2.fromOffset(110, 24),
+    Position = UDim2.fromOffset(10, 36),
+    BackgroundTransparency = 1,
+    Text = "Main Switch",
+    TextColor3 = Color3.fromRGB(215, 215, 225),
+    TextSize = 13,
+    Font = Enum.Font.Gotham,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, main)
+
+local switchBtn = new("TextButton", {
+    Size = UDim2.fromOffset(56, 24),
+    Position = UDim2.new(1, -66, 0, 36),
+    BackgroundColor3 = Color3.fromRGB(60, 60, 72),
+    Text = "OFF",
+    TextColor3 = Color3.fromRGB(235, 235, 245),
+    TextSize = 12,
+    Font = Enum.Font.GothamBold,
+    AutoButtonColor = false,
+    BorderSizePixel = 0,
+}, main)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, switchBtn)
+
+-- Tween Time slider
+local tweenLabel = new("TextLabel", {
+    Size = UDim2.new(1, -20, 0, 18),
+    Position = UDim2.fromOffset(10, 68),
+    BackgroundTransparency = 1,
+    Text = "Tween Time: 0.10",
+    TextColor3 = Color3.fromRGB(215, 215, 225),
+    TextSize = 13,
+    Font = Enum.Font.Gotham,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, main)
+
+local sliderArea = new("Frame", {
+    Size = UDim2.new(1, -20, 0, 16),
+    Position = UDim2.fromOffset(10, 88),
+    BackgroundTransparency = 1,
+}, main)
+
+local track = new("Frame", {
+    Size = UDim2.new(1, 0, 0, 6),
+    Position = UDim2.new(0, 0, 0.5, 0),
+    AnchorPoint = Vector2.new(0, 0.5),
+    BackgroundColor3 = Color3.fromRGB(58, 58, 70),
+    BorderSizePixel = 0,
+}, sliderArea)
+new("UICorner", { CornerRadius = UDim.new(1, 0) }, track)
+
+local fill = new("Frame", {
+    Size = UDim2.new(0, 0, 1, 0),
+    BackgroundColor3 = Color3.fromRGB(90, 160, 255),
+    BorderSizePixel = 0,
+}, track)
+new("UICorner", { CornerRadius = UDim.new(1, 0) }, fill)
+
+local knob = new("Frame", {
+    Size = UDim2.fromOffset(12, 12),
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.new(0, 0, 0.5, 0),
+    BackgroundColor3 = Color3.fromRGB(240, 240, 250),
+    BorderSizePixel = 0,
+}, sliderArea)
+new("UICorner", { CornerRadius = UDim.new(1, 0) }, knob)
+
+local function refreshSlider()
+    local alpha = (state.tweenTime - MIN_TWEEN) / (MAX_TWEEN - MIN_TWEEN)
+    fill.Size = UDim2.new(alpha, 0, 1, 0)
+    knob.Position = UDim2.new(alpha, 0, 0.5, 0)
+    tweenLabel.Text = string.format("Tween Time: %.2f", state.tweenTime)
+end
+refreshSlider()
+
+local sliding = false
+local function applySliderInput(input)
+    local rel = (input.Position.X - sliderArea.AbsolutePosition.X)
+                / math.max(sliderArea.AbsoluteSize.X, 1)
+    local alpha = math.clamp(rel, 0, 1)
+    local t = MIN_TWEEN + alpha * (MAX_TWEEN - MIN_TWEEN)
+    state.tweenTime = math.floor(t * 100 + 0.5) / 100
+    refreshSlider()
+end
+
+sliderArea.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        sliding = true
+        applySliderInput(input)
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                sliding = false
+            end
+        end)
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if sliding and (input.UserInputType == Enum.UserInputType.MouseMovement
+    or input.UserInputType == Enum.UserInputType.Touch) then
+        applySliderInput(input)
+    end
+end)
+
+-- Field Select (single-select)
+new("TextLabel", {
+    Size = UDim2.new(1, -20, 0, 18),
+    Position = UDim2.fromOffset(10, 110),
+    BackgroundTransparency = 1,
+    Text = "Field Select",
+    TextColor3 = Color3.fromRGB(215, 215, 225),
+    TextSize = 13,
+    Font = Enum.Font.Gotham,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, main)
+
+local fieldBtn = new("TextButton", {
+    Size = UDim2.new(1, -20, 0, 26),
+    Position = UDim2.fromOffset(10, 130),
+    BackgroundColor3 = Color3.fromRGB(55, 55, 68),
+    Text = state.field .. "   v",
+    TextColor3 = Color3.fromRGB(235, 235, 245),
+    TextSize = 13,
+    Font = Enum.Font.Gotham,
+    AutoButtonColor = false,
+    BorderSizePixel = 0,
+}, main)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, fieldBtn)
+
+local fieldDropdown = new("Frame", {
+    Size = UDim2.new(1, -20, 0, #FIELD_ORDER * 24),
+    Position = UDim2.fromOffset(10, 158),
+    BackgroundColor3 = Color3.fromRGB(40, 40, 50),
+    BorderSizePixel = 0,
+    Visible = false,
+    ZIndex = 5,
+}, main)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, fieldDropdown)
+new("UIStroke", { Color = Color3.fromRGB(80, 80, 95), Thickness = 1 }, fieldDropdown)
+
+-- Token Select (multi-select)
+new("TextLabel", {
+    Size = UDim2.new(1, -20, 0, 18),
+    Position = UDim2.fromOffset(10, 164),
+    BackgroundTransparency = 1,
+    Text = "Token Select",
+    TextColor3 = Color3.fromRGB(215, 215, 225),
+    TextSize = 13,
+    Font = Enum.Font.Gotham,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, main)
+
+local tokenBtn = new("TextButton", {
+    Size = UDim2.new(1, -20, 0, 26),
+    Position = UDim2.fromOffset(10, 184),
+    BackgroundColor3 = Color3.fromRGB(55, 55, 68),
+    Text = "",
+    TextColor3 = Color3.fromRGB(235, 235, 245),
+    TextSize = 13,
+    Font = Enum.Font.Gotham,
+    AutoButtonColor = false,
+    BorderSizePixel = 0,
+}, main)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, tokenBtn)
+
+local tokenBtnLabel = new("TextLabel", {
+    Size = UDim2.new(1, -20, 1, 0),
+    Position = UDim2.fromOffset(10, 0),
+    BackgroundTransparency = 1,
+    Text = "",
+    TextColor3 = Color3.fromRGB(235, 235, 245),
+    TextSize = 13,
+    Font = Enum.Font.Gotham,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, tokenBtn)
+
+local tokenDropdown = new("Frame", {
+    Size = UDim2.new(1, -20, 0, #TOKEN_ORDER * 24),
+    Position = UDim2.fromOffset(10, 212),
+    BackgroundColor3 = Color3.fromRGB(40, 40, 50),
+    BorderSizePixel = 0,
+    Visible = false,
+    ZIndex = 5,
+}, main)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, tokenDropdown)
+new("UIStroke", { Color = Color3.fromRGB(80, 80, 95), Thickness = 1 }, tokenDropdown)
+
+-- Refresh the token-button label to show "N/M selected".
+local function refreshTokenBtnLabel()
+    local count = 0
+    for _, id in ipairs(TOKEN_ORDER) do
+        if selectedTokens[id] then count = count + 1 end
+    end
+    tokenBtnLabel.Text = string.format("Tokens (%d/%d)   v", count, #TOKEN_ORDER)
+end
+refreshTokenBtnLabel()
+
+-- Close the other dropdown whenever one opens.
+local function closeAllDropdowns()
+    fieldDropdown.Visible = false
+    tokenDropdown.Visible = false
+end
+
+-- Build field dropdown items
+for i, name in ipairs(FIELD_ORDER) do
+    local item = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, 24),
+        Position = UDim2.fromOffset(0, (i - 1) * 24),
+        BackgroundTransparency = 1,
+        BackgroundColor3 = Color3.fromRGB(90, 160, 255),
+        Text = name,
+        TextColor3 = Color3.fromRGB(225, 225, 235),
+        TextSize = 13,
+        Font = Enum.Font.Gotham,
+        AutoButtonColor = false,
+        BorderSizePixel = 0,
+        ZIndex = 6,
+    }, fieldDropdown)
+    item.MouseButton1Click:Connect(function()
+        state.field = name
+        fieldBtn.Text = name .. "   v"
+        closeAllDropdowns()
+    end)
+    item.MouseEnter:Connect(function() item.BackgroundTransparency = 0.85 end)
+    item.MouseLeave:Connect(function() item.BackgroundTransparency = 1 end)
+end
+
+-- Build token dropdown items (checkbox + label per type)
+for i, tokenId in ipairs(TOKEN_ORDER) do
+    local y = (i - 1) * 24
+    local name = TOKEN_IDS[tokenId]
+
+    local item = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, 24),
+        Position = UDim2.fromOffset(0, y),
+        BackgroundTransparency = 1,
+        BackgroundColor3 = Color3.fromRGB(90, 160, 255),
+        Text = "",
+        AutoButtonColor = false,
+        BorderSizePixel = 0,
+        ZIndex = 6,
+    }, tokenDropdown)
+
+    local checkBox = new("Frame", {
+        Size = UDim2.fromOffset(14, 14),
+        Position = UDim2.fromOffset(10, 5),
+        BackgroundColor3 = Color3.fromRGB(90, 160, 255),
+        BorderSizePixel = 0,
+        ZIndex = 7,
+    }, item)
+    new("UICorner", { CornerRadius = UDim.new(0, 3) }, checkBox)
+    new("UIStroke", { Color = Color3.fromRGB(120, 120, 140), Thickness = 1 }, checkBox)
+
+    local checkMark = new("TextLabel", {
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        Text = "✓",
+        TextColor3 = Color3.fromRGB(255, 255, 255),
+        TextSize = 11,
+        Font = Enum.Font.GothamBold,
+        ZIndex = 8,
+    }, checkBox)
+
+    new("TextLabel", {
+        Size = UDim2.new(1, -32, 1, 0),
+        Position = UDim2.fromOffset(32, 0),
+        BackgroundTransparency = 1,
+        Text = name,
+        TextColor3 = Color3.fromRGB(225, 225, 235),
+        TextSize = 13,
+        Font = Enum.Font.Gotham,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        ZIndex = 7,
+    }, item)
+
+    local function refreshCheck()
+        if selectedTokens[tokenId] then
+            checkBox.BackgroundColor3 = Color3.fromRGB(90, 160, 255)
+            checkMark.Visible = true
+        else
+            checkBox.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+            checkMark.Visible = false
+        end
+    end
+    refreshCheck()
+
+    item.MouseButton1Click:Connect(function()
+        selectedTokens[tokenId] = not selectedTokens[tokenId]
+        refreshCheck()
+        refreshTokenBtnLabel()
+    end)
+    item.MouseEnter:Connect(function() item.BackgroundTransparency = 0.85 end)
+    item.MouseLeave:Connect(function() item.BackgroundTransparency = 1 end)
+end
+
+fieldBtn.MouseButton1Click:Connect(function()
+    local wasOpen = fieldDropdown.Visible
+    closeAllDropdowns()
+    fieldDropdown.Visible = not wasOpen
+end)
+
+tokenBtn.MouseButton1Click:Connect(function()
+    local wasOpen = tokenDropdown.Visible
+    closeAllDropdowns()
+    tokenDropdown.Visible = not wasOpen
+end)
+
+--=============================================================
+-- MINIMIZE
+--=============================================================
+local function setMinimized(v)
+    state.minimized = v
+    closeAllDropdowns()
+    if v then
+        miniBtn.Position = main.Position
+        main.Visible = false
+        miniBtn.Visible = true
+    else
+        main.Position = miniBtn.Position
+        main.Visible = true
+        miniBtn.Visible = false
+    end
+end
+
+minBtn.MouseButton1Click:Connect(function() setMinimized(true) end)
+miniBtn.MouseButton1Click:Connect(function() setMinimized(false) end)
+
+--=============================================================
+-- DRAG
+--=============================================================
+local function makeDraggable(handle, target)
+    local dragging, dragStart, startPos
+    handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos  = target.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            target.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+makeDraggable(titleBar, main)
+makeDraggable(miniBtn, miniBtn)
+
+--=============================================================
+-- MAIN SWITCH
+--=============================================================
+local function refreshSwitch()
+    if state.running then
+        switchBtn.Text = "ON"
+        switchBtn.BackgroundColor3 = Color3.fromRGB(56, 168, 96)
+    else
+        switchBtn.Text = "OFF"
+        switchBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 72)
+    end
+end
+refreshSwitch()
+
+switchBtn.MouseButton1Click:Connect(function()
+    state.running = not state.running
+    if not state.running and currentTween then
+        pcall(function() currentTween:Cancel() end)
+        currentTween = nil
+    end
+    refreshSwitch()
+end)
+
+--=============================================================
+-- SCAN ROOTS
+--=============================================================
 local scanRoots = {}
 for _, name in ipairs(SEARCH_FOLDERS) do
-    local folder = workspace:FindFirstChild(name)
-    if folder then table.insert(scanRoots, folder) end
+    local f = workspace:FindFirstChild(name)
+    if f then table.insert(scanRoots, f) end
 end
-if #scanRoots == 0 then
-    scanRoots = {workspace}   -- fallback if the folders aren't found
-end
+if #scanRoots == 0 then scanRoots = { workspace } end
 
-local function findTargetParts()
-    local matches = {}
+--=============================================================
+-- TOKEN TRACKING
+--=============================================================
+local function snapshotTargets()
+    local list = {}
     for _, root in ipairs(scanRoots) do
         if root.Parent then
-            for _, obj in ipairs(root:GetDescendants()) do
-                if obj:IsA("BasePart")
-                   and isInBounds(obj.Position)
-                   and hasTargetAsset(obj)
-                then
-                    table.insert(matches, obj)
+            for _, inst in ipairs(root:GetDescendants()) do
+                if getTokenId(inst) then
+                    list[#list + 1] = inst
                 end
             end
         end
     end
-    return matches
+    return list
 end
 
-local function getClosestPart(parts, rootPart)
-    local closest, shortest = nil, math.huge
-    for _, part in ipairs(parts) do
-        local d = (rootPart.Position - part.Position).Magnitude
-        if d < shortest then
-            shortest = d
-            closest  = part
+local function trackPart(part)
+    if not part or not part:IsA("BasePart") then return end
+    if skipTokens[part] then return end
+    if activeTokens[part] then return end
+
+    local tokenId = getTokenId(part)
+    if not tokenId then return end
+
+    activeTokens[part] = tokenId
+
+    part.AncestryChanged:Connect(function(_, parent)
+        if not parent then
+            activeTokens[part] = nil
+        end
+    end)
+end
+
+local function considerDescendant(desc)
+    trackPart(desc)
+    local parent = desc.Parent
+    if parent and parent:IsA("BasePart") then
+        trackPart(parent)
+    end
+end
+
+--=============================================================
+-- INITIAL EXCLUSION + EVENT HOOKS
+--=============================================================
+task.spawn(function()
+    if not game:IsLoaded() then game.Loaded:Wait() end
+    task.wait(INITIAL_SCAN_DELAY)
+
+    -- Hook first so nothing spawned during the snapshot is missed.
+    for _, root in ipairs(scanRoots) do
+        root.DescendantAdded:Connect(considerDescendant)
+    end
+
+    local initial = snapshotTargets()
+    for _, part in ipairs(initial) do
+        skipTokens[part] = true
+        activeTokens[part] = nil
+    end
+    exclusionsReady = true
+
+    warn(("[CommonTokenTweener] Excluded %d initial token(s); roots: %s")
+        :format(#initial, table.concat(
+            (function()
+                local names = {}
+                for _, r in ipairs(scanRoots) do names[#names + 1] = r.Name end
+                return names
+            end)(), ", ")))
+end)
+
+--=============================================================
+-- NEAREST TOKEN  (filters by selection + bounds)
+--=============================================================
+local function findNearest(fromPos, bounds)
+    local keys = {}
+    for part in pairs(activeTokens) do keys[#keys + 1] = part end
+
+    local best, bestDist
+    for _, part in ipairs(keys) do
+        local tokenId = activeTokens[part]
+        if tokenId
+        and part.Parent
+        and not skipTokens[part]
+        and selectedTokens[tokenId] then
+            local p = part.Position
+            if p.X >= bounds.minX and p.X <= bounds.maxX
+            and p.Z >= bounds.minZ and p.Z <= bounds.maxZ then
+                local d = (p - fromPos).Magnitude
+                if not bestDist or d < bestDist then
+                    best, bestDist = part, d
+                end
+            end
         end
     end
-    return closest
+    return best
 end
 
-local function tweenToPart(targetPart)
-    local _, root, humanoid = getCharacter()
-    if not root or not humanoid or not targetPart.Parent then return end
-
-    humanoid:ChangeState(Enum.HumanoidStateType.Physics)
-
-    local targetCFrame = CFrame.new(targetPart.Position + Vector3.new(0, HOVER_HEIGHT, 0))
-    local info  = TweenInfo.new(TWEEN_TIME, Enum.EasingStyle.Linear, Enum.EasingDirection.Out)
-    local tween = TweenService:Create(root, info, {CFrame = targetCFrame})
-
-    tween:Play()
-    tween.Completed:Wait()
-
-    humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
-end
-
--- ──────────────────────────────────────────────────────────────
--- Initial scan (runs once at startup, synchronously)
--- ──────────────────────────────────────────────────────────────
-do
-    local existing = findTargetParts()
-    for _, token in ipairs(existing) do
-        skipTokens[token] = true
-    end
-    print(("[AutoTween] Initial scan blacklisted %d in-bounds token(s).")
-        :format(#existing))
-end
-
--- ──────────────────────────────────────────────────────────────
--- Automatic main loop (no key press required)
--- ──────────────────────────────────────────────────────────────
+--=============================================================
+-- MAIN LOOP
+--=============================================================
 task.spawn(function()
     while true do
-        task.wait(POLL_INTERVAL)
+        if state.running and exclusionsReady then
+            local char = LocalPlayer.Character
+            local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+            local hum  = char and char:FindFirstChildOfClass("Humanoid")
 
-        local _, root = getCharacter()
-        if root then
-            -- Gather fresh, in-bounds, non-skipped tokens
-            local candidates = {}
-            for _, token in ipairs(findTargetParts()) do
-                if not skipTokens[token] then
-                    table.insert(candidates, token)
-                end
-            end
+            if hrp and hum and hum.Health > 0 then
+                local target = findNearest(hrp.Position, fieldBounds(state.field))
 
-            if #candidates > 0 then
-                local closest = getClosestPart(candidates, root)
-                if closest then
-                    skipTokens[closest] = true   -- don't re-target it
-                    tweenToPart(closest)
+                if target and target.Parent then
+                    -- Consume BEFORE tweening: never re-select this instance.
+                    skipTokens[target] = true
+                    activeTokens[target] = nil
+
+                    local dist = (target.Position - hrp.Position).Magnitude
+                    if dist > 0.5 then
+                        local info = TweenInfo.new(
+                            state.tweenTime,
+                            Enum.EasingStyle.Linear,
+                            Enum.EasingDirection.Out
+                        )
+                        local tween = TweenService:Create(hrp, info, {
+                            CFrame = CFrame.new(target.Position)
+                        })
+                        currentTween = tween
+                        tween:Play()
+                        tween.Completed:Wait()
+                        if currentTween == tween then
+                            currentTween = nil
+                        end
+                    end
+                    task.wait(0.05)
+                else
+                    task.wait(POLL_INTERVAL)
                 end
+            else
+                task.wait(0.2)
             end
+        else
+            task.wait(0.1)
         end
     end
 end)

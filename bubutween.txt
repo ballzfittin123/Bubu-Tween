@@ -1,7 +1,7 @@
 --=============================================================
 --  Jelly's Legit Script
 --  LocalScript -> StarterPlayer > StarterPlayerScripts
---  Event-driven scanning | tween-once | multi-select | persistence
+--  Priority-queue tweening (closest-first) | multi-select | globals
 --=============================================================
 
 local Players          = game:GetService("Players")
@@ -24,6 +24,12 @@ local TOKEN_IDS = {
 }
 local TOKEN_ORDER = { 2028453802, 1952740625, 1952682401, 1952796032, 3012679515 }
 
+local GLOBAL_TOKEN_IDS = {
+    [1838129169] = "Gumdrops",
+    [1674871631] = "Tickets",
+}
+local GLOBAL_TOKEN_ORDER = { 1838129169, 1674871631 }
+
 local FIELDS = {
     ["Sunflower"]  = { Vector2.new(-255, 246),  Vector2.new(-167, 103) },
     ["Strawberry"] = { Vector2.new(-223, -63),  Vector2.new(-132, 44)  },
@@ -35,7 +41,7 @@ local FIELDS = {
 local FIELD_ORDER = { "Sunflower", "Strawberry", "Pine tree", "Coconut", "Pepper", "Pineapple" }
 
 local SEARCH_FOLDERS       = { "Collectibles", "Tokens" }
-local MIN_TWEEN, MAX_TWEEN = 0.05, 0.50
+local MIN_TWEEN, MAX_TWEEN = 0.05, 0.30
 local INITIAL_SCAN_DELAY   = 1.0
 local POLL_INTERVAL        = 0.1
 local CONFIG_PATH          = "JellysLegitScript_config.json"
@@ -50,20 +56,28 @@ local state = {
 }
 
 local selectedFields = {}
-for _, name in ipairs(FIELD_ORDER) do
-    selectedFields[name] = true
-end
+for _, name in ipairs(FIELD_ORDER) do selectedFields[name] = true end
 
 local selectedTokens = {}
-for _, id in ipairs(TOKEN_ORDER) do
-    selectedTokens[id] = true
-end
+for _, id in ipairs(TOKEN_ORDER) do selectedTokens[id] = true end
+
+local selectedGlobals = {}
+for _, id in ipairs(GLOBAL_TOKEN_ORDER) do selectedGlobals[id] = true end
 
 local currentTween    = nil
 local exclusionsReady = false
 
+-- Permanently skipped tokens (initial snapshot + consumed). Weak-keyed.
 local skipTokens = setmetatable({}, { __mode = "k" })
-local activeTokens = {}  -- [BasePart] = tokenId
+
+-- Master registry: [BasePart] = { id = tokenId, global = bool }
+local activeTokens = {}
+
+-- Sorted priority list (closest first) — rebuilt only when stale.
+-- Each entry: { part = BasePart, dist = number }
+local priorityList   = {}
+local priorityStale  = true
+local priorityOrigin = nil  -- Vector3 the list was sorted around
 
 --=============================================================
 -- UTILITIES
@@ -92,50 +106,46 @@ end
 --=============================================================
 -- TOKEN DETECTION
 --=============================================================
-local function getTokenId(part)
+local function getTokenInfo(part)
     if not part or not part:IsA("BasePart") then return nil end
 
-    if part:IsA("MeshPart") then
-        local mid = assetIdOf(part.MeshId)
-        if mid and TOKEN_IDS[mid] then return mid end
-        local tid = assetIdOf(part.TextureID)
-        if tid and TOKEN_IDS[tid] then return tid end
+    local function check(id)
+        if not id then return nil end
+        if TOKEN_IDS[id]        then return { id = id, global = false } end
+        if GLOBAL_TOKEN_IDS[id] then return { id = id, global = true  } end
+        return nil
     end
 
+    if part:IsA("MeshPart") then
+        local r = check(assetIdOf(part.MeshId))
+        if r then return r end
+        r = check(assetIdOf(part.TextureID))
+        if r then return r end
+    end
     local decal = part:FindFirstChildOfClass("Decal")
     if decal then
-        local id = assetIdOf(decal.Texture)
-        if id and TOKEN_IDS[id] then return id end
+        local r = check(assetIdOf(decal.Texture)); if r then return r end
     end
-
     local tex = part:FindFirstChildOfClass("Texture")
     if tex then
-        local id = assetIdOf(tex.Texture)
-        if id and TOKEN_IDS[id] then return id end
+        local r = check(assetIdOf(tex.Texture)); if r then return r end
     end
-
     local sm = part:FindFirstChildOfClass("SpecialMesh")
     if sm then
-        local mid = assetIdOf(sm.MeshId)
-        if mid and TOKEN_IDS[mid] then return mid end
-        local tid = assetIdOf(sm.TextureId)
-        if tid and TOKEN_IDS[tid] then return tid end
+        local r = check(assetIdOf(sm.MeshId)); if r then return r end
+        r = check(assetIdOf(sm.TextureId)); if r then return r end
     end
-
     return nil
 end
 
 --=============================================================
--- PERSISTENCE  (uses executor writefile/readfile; silent no-op in Studio)
+-- PERSISTENCE
 --=============================================================
 local function canSave()
     return type(writefile) == "function" and type(readfile) == "function"
 end
-
 local function fileExists()
-    if type(isfile) == "function" then
-        return isfile(CONFIG_PATH)
-    end
+    if type(isfile) == "function" then return isfile(CONFIG_PATH) end
     return false
 end
 
@@ -143,14 +153,10 @@ local function loadConfig()
     if not canSave() or not fileExists() then return end
     local ok, content = pcall(readfile, CONFIG_PATH)
     if not ok or type(content) ~= "string" then return end
-    local ok2, data = pcall(function()
-        return HttpService:JSONDecode(content)
-    end)
+    local ok2, data = pcall(function() return HttpService:JSONDecode(content) end)
     if not ok2 or type(data) ~= "table" then return end
 
-    if type(data.enabled) == "boolean" then
-        state.running = data.enabled
-    end
+    if type(data.enabled) == "boolean" then state.running = data.enabled end
     if type(data.tweenTime) == "number" then
         state.tweenTime = math.clamp(data.tweenTime, MIN_TWEEN, MAX_TWEEN)
     end
@@ -169,23 +175,29 @@ local function loadConfig()
             end
         end
     end
+    if type(data.globals) == "table" then
+        for idStr, val in pairs(data.globals) do
+            local id = tonumber(idStr)
+            if id and GLOBAL_TOKEN_IDS[id] and type(val) == "boolean" then
+                selectedGlobals[id] = val
+            end
+        end
+    end
 end
 
 local function saveConfig()
     if not canSave() then return end
-    local tokenMap = {}
-    for id, val in pairs(selectedTokens) do
-        tokenMap[tostring(id)] = val
-    end
+    local tokenMap, globalMap = {}, {}
+    for id, val in pairs(selectedTokens) do tokenMap[tostring(id)] = val end
+    for id, val in pairs(selectedGlobals) do globalMap[tostring(id)] = val end
     local data = {
         enabled   = state.running,
         tweenTime = state.tweenTime,
         fields    = selectedFields,
         tokens    = tokenMap,
+        globals   = globalMap,
     }
-    local ok, encoded = pcall(function()
-        return HttpService:JSONEncode(data)
-    end)
+    local ok, encoded = pcall(function() return HttpService:JSONEncode(data) end)
     if not ok then return end
     pcall(writefile, CONFIG_PATH, encoded)
 end
@@ -202,14 +214,13 @@ local gui = new("ScreenGui", {
 }, PlayerGui)
 
 local main = new("Frame", {
-    Size = UDim2.fromOffset(240, 216),
+    Size = UDim2.fromOffset(240, 262),
     Position = UDim2.new(0, 40, 0, 100),
     BackgroundColor3 = Color3.fromRGB(24, 20, 32),
     BorderSizePixel = 0,
 }, gui)
 new("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
 
--- Animated purple gradient stroke (dynamic outline)
 local mainStroke = new("UIStroke", {
     Thickness = 2,
     Color = Color3.fromRGB(150, 70, 255),
@@ -224,7 +235,6 @@ local mainGrad = new("UIGradient", {
     Rotation = 0,
 }, mainStroke)
 
--- Title bar
 local titleBar = new("Frame", {
     Size = UDim2.new(1, 0, 0, 28),
     BackgroundColor3 = Color3.fromRGB(40, 30, 55),
@@ -238,8 +248,7 @@ new("TextLabel", {
     BackgroundTransparency = 1,
     Text = "Jelly's Legit Script",
     TextColor3 = Color3.fromRGB(235, 225, 255),
-    TextSize = 13,
-    Font = Enum.Font.GothamBold,
+    TextSize = 13, Font = Enum.Font.GothamBold,
     TextXAlignment = Enum.TextXAlignment.Left,
 }, titleBar)
 
@@ -249,33 +258,24 @@ local minBtn = new("TextButton", {
     BackgroundTransparency = 1,
     Text = "–",
     TextColor3 = Color3.fromRGB(210, 190, 255),
-    TextSize = 16,
-    Font = Enum.Font.GothamBold,
+    TextSize = 16, Font = Enum.Font.GothamBold,
     AutoButtonColor = false,
 }, titleBar)
 
--- Mini button (minimized)
 local miniBtn = new("TextButton", {
     Size = UDim2.fromOffset(44, 44),
     Position = main.Position,
     BackgroundColor3 = Color3.fromRGB(40, 30, 55),
     Text = "JL",
     TextColor3 = Color3.fromRGB(235, 225, 255),
-    TextSize = 14,
-    Font = Enum.Font.GothamBold,
-    AutoButtonColor = false,
-    BorderSizePixel = 0,
-    Visible = false,
+    TextSize = 14, Font = Enum.Font.GothamBold,
+    AutoButtonColor = false, BorderSizePixel = 0, Visible = false,
 }, gui)
 new("UICorner", { CornerRadius = UDim.new(1, 0) }, miniBtn)
 local miniStroke = new("UIStroke", {
-    Thickness = 2,
-    Color = Color3.fromRGB(150, 70, 255),
+    Thickness = 2, Color = Color3.fromRGB(150, 70, 255),
 }, miniBtn)
-local miniGrad = new("UIGradient", {
-    Color = mainGrad.Color,
-    Rotation = 0,
-}, miniStroke)
+local miniGrad = new("UIGradient", { Color = mainGrad.Color, Rotation = 0 }, miniStroke)
 
 -- Main Switch
 new("TextLabel", {
@@ -284,8 +284,7 @@ new("TextLabel", {
     BackgroundTransparency = 1,
     Text = "Main Switch",
     TextColor3 = Color3.fromRGB(215, 205, 240),
-    TextSize = 13,
-    Font = Enum.Font.Gotham,
+    TextSize = 13, Font = Enum.Font.Gotham,
     TextXAlignment = Enum.TextXAlignment.Left,
 }, main)
 
@@ -295,22 +294,19 @@ local switchBtn = new("TextButton", {
     BackgroundColor3 = Color3.fromRGB(60, 50, 80),
     Text = "OFF",
     TextColor3 = Color3.fromRGB(235, 225, 255),
-    TextSize = 12,
-    Font = Enum.Font.GothamBold,
-    AutoButtonColor = false,
-    BorderSizePixel = 0,
+    TextSize = 12, Font = Enum.Font.GothamBold,
+    AutoButtonColor = false, BorderSizePixel = 0,
 }, main)
 new("UICorner", { CornerRadius = UDim.new(0, 6) }, switchBtn)
 
--- Field Select (multi)
+-- Field Select
 new("TextLabel", {
     Size = UDim2.new(1, -20, 0, 18),
     Position = UDim2.fromOffset(10, 68),
     BackgroundTransparency = 1,
     Text = "Field Select",
     TextColor3 = Color3.fromRGB(215, 205, 240),
-    TextSize = 13,
-    Font = Enum.Font.Gotham,
+    TextSize = 13, Font = Enum.Font.Gotham,
     TextXAlignment = Enum.TextXAlignment.Left,
 }, main)
 
@@ -318,20 +314,16 @@ local fieldBtn = new("TextButton", {
     Size = UDim2.new(1, -20, 0, 26),
     Position = UDim2.fromOffset(10, 86),
     BackgroundColor3 = Color3.fromRGB(55, 45, 75),
-    Text = "",
-    AutoButtonColor = false,
-    BorderSizePixel = 0,
+    Text = "", AutoButtonColor = false, BorderSizePixel = 0,
 }, main)
 new("UICorner", { CornerRadius = UDim.new(0, 6) }, fieldBtn)
 
 local fieldBtnLabel = new("TextLabel", {
     Size = UDim2.new(1, -20, 1, 0),
     Position = UDim2.fromOffset(10, 0),
-    BackgroundTransparency = 1,
-    Text = "",
+    BackgroundTransparency = 1, Text = "",
     TextColor3 = Color3.fromRGB(235, 225, 255),
-    TextSize = 13,
-    Font = Enum.Font.Gotham,
+    TextSize = 13, Font = Enum.Font.Gotham,
     TextXAlignment = Enum.TextXAlignment.Left,
 }, fieldBtn)
 
@@ -339,22 +331,19 @@ local fieldDropdown = new("Frame", {
     Size = UDim2.new(1, -20, 0, #FIELD_ORDER * 24),
     Position = UDim2.fromOffset(10, 112),
     BackgroundColor3 = Color3.fromRGB(35, 28, 48),
-    BorderSizePixel = 0,
-    Visible = false,
-    ZIndex = 5,
+    BorderSizePixel = 0, Visible = false, ZIndex = 5,
 }, main)
 new("UICorner", { CornerRadius = UDim.new(0, 6) }, fieldDropdown)
 new("UIStroke", { Thickness = 1, Color = Color3.fromRGB(120, 60, 200) }, fieldDropdown)
 
--- Token Select (multi)
+-- Token Select
 new("TextLabel", {
     Size = UDim2.new(1, -20, 0, 18),
     Position = UDim2.fromOffset(10, 120),
     BackgroundTransparency = 1,
     Text = "Token Select",
     TextColor3 = Color3.fromRGB(215, 205, 240),
-    TextSize = 13,
-    Font = Enum.Font.Gotham,
+    TextSize = 13, Font = Enum.Font.Gotham,
     TextXAlignment = Enum.TextXAlignment.Left,
 }, main)
 
@@ -362,20 +351,16 @@ local tokenBtn = new("TextButton", {
     Size = UDim2.new(1, -20, 0, 26),
     Position = UDim2.fromOffset(10, 138),
     BackgroundColor3 = Color3.fromRGB(55, 45, 75),
-    Text = "",
-    AutoButtonColor = false,
-    BorderSizePixel = 0,
+    Text = "", AutoButtonColor = false, BorderSizePixel = 0,
 }, main)
 new("UICorner", { CornerRadius = UDim.new(0, 6) }, tokenBtn)
 
 local tokenBtnLabel = new("TextLabel", {
     Size = UDim2.new(1, -20, 1, 0),
     Position = UDim2.fromOffset(10, 0),
-    BackgroundTransparency = 1,
-    Text = "",
+    BackgroundTransparency = 1, Text = "",
     TextColor3 = Color3.fromRGB(235, 225, 255),
-    TextSize = 13,
-    Font = Enum.Font.Gotham,
+    TextSize = 13, Font = Enum.Font.Gotham,
     TextXAlignment = Enum.TextXAlignment.Left,
 }, tokenBtn)
 
@@ -383,28 +368,62 @@ local tokenDropdown = new("Frame", {
     Size = UDim2.new(1, -20, 0, #TOKEN_ORDER * 24),
     Position = UDim2.fromOffset(10, 164),
     BackgroundColor3 = Color3.fromRGB(35, 28, 48),
-    BorderSizePixel = 0,
-    Visible = false,
-    ZIndex = 5,
+    BorderSizePixel = 0, Visible = false, ZIndex = 5,
 }, main)
 new("UICorner", { CornerRadius = UDim.new(0, 6) }, tokenDropdown)
 new("UIStroke", { Thickness = 1, Color = Color3.fromRGB(120, 60, 200) }, tokenDropdown)
 
--- Tween time
-local tweenLabel = new("TextLabel", {
+-- Global Token Select
+new("TextLabel", {
     Size = UDim2.new(1, -20, 0, 18),
     Position = UDim2.fromOffset(10, 172),
     BackgroundTransparency = 1,
+    Text = "Global Token Select",
+    TextColor3 = Color3.fromRGB(215, 205, 240),
+    TextSize = 13, Font = Enum.Font.Gotham,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, main)
+
+local globalBtn = new("TextButton", {
+    Size = UDim2.new(1, -20, 0, 26),
+    Position = UDim2.fromOffset(10, 190),
+    BackgroundColor3 = Color3.fromRGB(55, 45, 75),
+    Text = "", AutoButtonColor = false, BorderSizePixel = 0,
+}, main)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, globalBtn)
+
+local globalBtnLabel = new("TextLabel", {
+    Size = UDim2.new(1, -20, 1, 0),
+    Position = UDim2.fromOffset(10, 0),
+    BackgroundTransparency = 1, Text = "",
+    TextColor3 = Color3.fromRGB(235, 225, 255),
+    TextSize = 13, Font = Enum.Font.Gotham,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, globalBtn)
+
+local globalDropdown = new("Frame", {
+    Size = UDim2.new(1, -20, 0, #GLOBAL_TOKEN_ORDER * 24),
+    Position = UDim2.fromOffset(10, 216),
+    BackgroundColor3 = Color3.fromRGB(35, 28, 48),
+    BorderSizePixel = 0, Visible = false, ZIndex = 5,
+}, main)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, globalDropdown)
+new("UIStroke", { Thickness = 1, Color = Color3.fromRGB(120, 60, 200) }, globalDropdown)
+
+-- Tween time
+local tweenLabel = new("TextLabel", {
+    Size = UDim2.new(1, -20, 0, 18),
+    Position = UDim2.fromOffset(10, 218),
+    BackgroundTransparency = 1,
     Text = "Tween Time: 0.10",
     TextColor3 = Color3.fromRGB(215, 205, 240),
-    TextSize = 13,
-    Font = Enum.Font.Gotham,
+    TextSize = 13, Font = Enum.Font.Gotham,
     TextXAlignment = Enum.TextXAlignment.Left,
 }, main)
 
 local sliderArea = new("Frame", {
     Size = UDim2.new(1, -20, 0, 16),
-    Position = UDim2.fromOffset(10, 192),
+    Position = UDim2.fromOffset(10, 238),
     BackgroundTransparency = 1,
 }, main)
 
@@ -472,75 +491,65 @@ UserInputService.InputChanged:Connect(function(input)
     end
 end)
 
--- Dropdown open/close helpers
 local function closeAllDropdowns()
     fieldDropdown.Visible = false
     tokenDropdown.Visible = false
+    globalDropdown.Visible = false
 end
 
--- Button label refresh
 local function refreshFieldBtnLabel()
-    local count = 0
-    for _, name in ipairs(FIELD_ORDER) do
-        if selectedFields[name] then count = count + 1 end
-    end
-    fieldBtnLabel.Text = string.format("Fields (%d/%d)   v", count, #FIELD_ORDER)
+    local c = 0
+    for _, name in ipairs(FIELD_ORDER) do if selectedFields[name] then c = c + 1 end end
+    fieldBtnLabel.Text = string.format("Fields (%d/%d)   v", c, #FIELD_ORDER)
 end
-
 local function refreshTokenBtnLabel()
-    local count = 0
-    for _, id in ipairs(TOKEN_ORDER) do
-        if selectedTokens[id] then count = count + 1 end
-    end
-    tokenBtnLabel.Text = string.format("Tokens (%d/%d)   v", count, #TOKEN_ORDER)
+    local c = 0
+    for _, id in ipairs(TOKEN_ORDER) do if selectedTokens[id] then c = c + 1 end end
+    tokenBtnLabel.Text = string.format("Tokens (%d/%d)   v", c, #TOKEN_ORDER)
+end
+local function refreshGlobalBtnLabel()
+    local c = 0
+    for _, id in ipairs(GLOBAL_TOKEN_ORDER) do if selectedGlobals[id] then c = c + 1 end end
+    globalBtnLabel.Text = string.format("Globals (%d/%d)   v", c, #GLOBAL_TOKEN_ORDER)
 end
 refreshFieldBtnLabel()
 refreshTokenBtnLabel()
+refreshGlobalBtnLabel()
 
--- Checkbox row factory
+-- Checkbox factory
 local function makeCheckboxRow(parent, yPos, labelText, getSelected, setSelected)
     local item = new("TextButton", {
         Size = UDim2.new(1, 0, 0, 24),
         Position = UDim2.fromOffset(0, yPos),
         BackgroundTransparency = 1,
         BackgroundColor3 = Color3.fromRGB(150, 80, 255),
-        Text = "",
-        AutoButtonColor = false,
-        BorderSizePixel = 0,
-        ZIndex = 6,
+        Text = "", AutoButtonColor = false, BorderSizePixel = 0, ZIndex = 6,
     }, parent)
 
     local checkBox = new("Frame", {
         Size = UDim2.fromOffset(14, 14),
         Position = UDim2.fromOffset(10, 5),
         BackgroundColor3 = Color3.fromRGB(55, 45, 75),
-        BorderSizePixel = 0,
-        ZIndex = 7,
+        BorderSizePixel = 0, ZIndex = 7,
     }, item)
     new("UICorner", { CornerRadius = UDim.new(0, 3) }, checkBox)
     new("UIStroke", { Color = Color3.fromRGB(120, 60, 200), Thickness = 1 }, checkBox)
 
     local checkMark = new("TextLabel", {
         Size = UDim2.fromScale(1, 1),
-        BackgroundTransparency = 1,
-        Text = "✓",
+        BackgroundTransparency = 1, Text = "✓",
         TextColor3 = Color3.fromRGB(255, 255, 255),
-        TextSize = 11,
-        Font = Enum.Font.GothamBold,
-        ZIndex = 8,
-        Visible = false,
+        TextSize = 11, Font = Enum.Font.GothamBold,
+        ZIndex = 8, Visible = false,
     }, checkBox)
 
     new("TextLabel", {
         Size = UDim2.new(1, -32, 1, 0),
         Position = UDim2.fromOffset(32, 0),
-        BackgroundTransparency = 1,
-        Text = labelText,
+        BackgroundTransparency = 1, Text = labelText,
         TextColor3 = Color3.fromRGB(225, 215, 245),
-        TextSize = 13,
-        Font = Enum.Font.Gotham,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        ZIndex = 7,
+        TextSize = 13, Font = Enum.Font.Gotham,
+        TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 7,
     }, item)
 
     local function refresh()
@@ -557,6 +566,7 @@ local function makeCheckboxRow(parent, yPos, labelText, getSelected, setSelected
     item.MouseButton1Click:Connect(function()
         setSelected(not getSelected())
         refresh()
+        priorityStale = true
         saveConfig()
     end)
     item.MouseEnter:Connect(function() item.BackgroundTransparency = 0.85 end)
@@ -564,38 +574,37 @@ local function makeCheckboxRow(parent, yPos, labelText, getSelected, setSelected
 end
 
 for i, name in ipairs(FIELD_ORDER) do
-    makeCheckboxRow(
-        fieldDropdown,
-        (i - 1) * 24,
-        name,
+    makeCheckboxRow(fieldDropdown, (i - 1) * 24, name,
         function() return selectedFields[name] end,
-        function(v) selectedFields[name] = v; refreshFieldBtnLabel() end
-    )
+        function(v) selectedFields[name] = v; refreshFieldBtnLabel() end)
 end
-
 for i, tokenId in ipairs(TOKEN_ORDER) do
-    makeCheckboxRow(
-        tokenDropdown,
-        (i - 1) * 24,
-        TOKEN_IDS[tokenId],
+    makeCheckboxRow(tokenDropdown, (i - 1) * 24, TOKEN_IDS[tokenId],
         function() return selectedTokens[tokenId] end,
-        function(v) selectedTokens[tokenId] = v; refreshTokenBtnLabel() end
-    )
+        function(v) selectedTokens[tokenId] = v; refreshTokenBtnLabel() end)
+end
+for i, tokenId in ipairs(GLOBAL_TOKEN_ORDER) do
+    makeCheckboxRow(globalDropdown, (i - 1) * 24, GLOBAL_TOKEN_IDS[tokenId],
+        function() return selectedGlobals[tokenId] end,
+        function(v) selectedGlobals[tokenId] = v; refreshGlobalBtnLabel() end)
 end
 
 fieldBtn.MouseButton1Click:Connect(function()
-    local wasOpen = fieldDropdown.Visible
+    local was = fieldDropdown.Visible
     closeAllDropdowns()
-    fieldDropdown.Visible = not wasOpen
+    fieldDropdown.Visible = not was
 end)
-
 tokenBtn.MouseButton1Click:Connect(function()
-    local wasOpen = tokenDropdown.Visible
+    local was = tokenDropdown.Visible
     closeAllDropdowns()
-    tokenDropdown.Visible = not wasOpen
+    tokenDropdown.Visible = not was
+end)
+globalBtn.MouseButton1Click:Connect(function()
+    local was = globalDropdown.Visible
+    closeAllDropdowns()
+    globalDropdown.Visible = not was
 end)
 
--- Minimize
 local function setMinimized(v)
     state.minimized = v
     closeAllDropdowns()
@@ -609,11 +618,9 @@ local function setMinimized(v)
         miniBtn.Visible = false
     end
 end
-
 minBtn.MouseButton1Click:Connect(function() setMinimized(true) end)
 miniBtn.MouseButton1Click:Connect(function() setMinimized(false) end)
 
--- Drag
 local function makeDraggable(handle, target)
     local dragging, dragStart, startPos
     handle.InputBegan:Connect(function(input)
@@ -643,7 +650,6 @@ end
 makeDraggable(titleBar, main)
 makeDraggable(miniBtn, miniBtn)
 
--- Switch
 local function refreshSwitch()
     if state.running then
         switchBtn.Text = "ON"
@@ -666,7 +672,7 @@ switchBtn.MouseButton1Click:Connect(function()
 end)
 
 --=============================================================
--- DYNAMIC PURPLE OUTLINE ANIMATION
+-- DYNAMIC PURPLE OUTLINE
 --=============================================================
 task.spawn(function()
     local t = 0
@@ -693,6 +699,90 @@ end
 if #scanRoots == 0 then scanRoots = { workspace } end
 
 --=============================================================
+-- ELIGIBILITY
+--=============================================================
+local function isInAnySelectedField(pos)
+    for name, enabled in pairs(selectedFields) do
+        if enabled then
+            local b = fieldBounds(name)
+            if pos.X >= b.minX and pos.X <= b.maxX
+            and pos.Z >= b.minZ and pos.Z <= b.maxZ then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function isEligible(part, info)
+    if not info then return false end
+    if info.global then
+        return selectedGlobals[info.id] == true
+    end
+    return selectedTokens[info.id] == true
+       and isInAnySelectedField(part.Position)
+end
+
+--=============================================================
+-- PRIORITY LIST  (sorted closest-first around a reference origin)
+--  Rebuild is O(n log n) but only runs when the list is stale
+--  (new token added, selection changed, or player moved far
+--  enough that relative ordering could shift).
+--=============================================================
+local SORT_ORIGIN_TOLERANCE = 32  -- studs; beyond this, re-sort
+
+local function buildPriorityList(origin)
+    local list = {}
+    for part, info in pairs(activeTokens) do
+        if part.Parent
+        and not skipTokens[part]
+        and isEligible(part, info) then
+            list[#list + 1] = {
+                part = part,
+                dist = (part.Position - origin).Magnitude,
+            }
+        end
+    end
+    table.sort(list, function(a, b) return a.dist < b.dist end)
+    priorityList   = list
+    priorityOrigin = origin
+    priorityStale  = false
+end
+
+-- Insert a newly-tracked token into the sorted list without a full rebuild.
+local function insertIntoPriorityList(part, info, origin)
+    if not origin then return end
+    if not isEligible(part, info) then return end
+
+    local entry = { part = part, dist = (part.Position - origin).Magnitude }
+    -- Binary search insertion point.
+    local lo, hi = 1, #priorityList + 1
+    while lo < hi do
+        local mid = math.floor((lo + hi) / 2)
+        if priorityList[mid].dist < entry.dist then
+            lo = mid + 1
+        else
+            hi = mid
+        end
+    end
+    table.insert(priorityList, lo, entry)
+end
+
+-- Remove dead/consumed entries from the head of the list.
+local function prunePriorityList()
+    while #priorityList > 0 do
+        local entry = priorityList[1]
+        local part = entry.part
+        local info = activeTokens[part]
+        if not part.Parent or not info or skipTokens[part] or not isEligible(part, info) then
+            table.remove(priorityList, 1)
+        else
+            break
+        end
+    end
+end
+
+--=============================================================
 -- TOKEN TRACKING
 --=============================================================
 local function snapshotTargets()
@@ -700,7 +790,7 @@ local function snapshotTargets()
     for _, root in ipairs(scanRoots) do
         if root.Parent then
             for _, inst in ipairs(root:GetDescendants()) do
-                if getTokenId(inst) then
+                if getTokenInfo(inst) then
                     list[#list + 1] = inst
                 end
             end
@@ -711,13 +801,19 @@ end
 
 local function trackPart(part)
     if not part or not part:IsA("BasePart") then return end
-    if skipTokens[part] then return end
-    if activeTokens[part] then return end
+    if skipTokens[part] or activeTokens[part] then return end
 
-    local tokenId = getTokenId(part)
-    if not tokenId then return end
+    local info = getTokenInfo(part)
+    if not info then return end
 
-    activeTokens[part] = tokenId
+    activeTokens[part] = info
+
+    -- Insert into priority list if we already have an origin.
+    if priorityOrigin then
+        insertIntoPriorityList(part, info, priorityOrigin)
+    else
+        priorityStale = true
+    end
 
     part.AncestryChanged:Connect(function(_, parent)
         if not parent then
@@ -751,6 +847,7 @@ task.spawn(function()
         activeTokens[part] = nil
     end
     exclusionsReady = true
+    priorityStale = true
 
     warn(("[Jelly's Legit Script] Ready. Excluded %d initial token(s); roots: %s")
         :format(#initial, table.concat(
@@ -762,40 +859,22 @@ task.spawn(function()
 end)
 
 --=============================================================
--- POSITION FILTERS
+-- PICK NEXT TARGET
+--  Walks the priority list from the closest entry outward. The
+--  list is lazily rebuilt when stale or when the player has moved
+--  far enough that its ordering may be wrong.
 --=============================================================
-local function isInAnySelectedField(pos)
-    for name, enabled in pairs(selectedFields) do
-        if enabled then
-            local b = fieldBounds(name)
-            if pos.X >= b.minX and pos.X <= b.maxX
-            and pos.Z >= b.minZ and pos.Z <= b.maxZ then
-                return true
-            end
-        end
+local function pickTarget(origin)
+    if priorityStale
+    or not priorityOrigin
+    or (origin - priorityOrigin).Magnitude > SORT_ORIGIN_TOLERANCE then
+        buildPriorityList(origin)
     end
-    return false
-end
 
-local function findNearest(fromPos)
-    local keys = {}
-    for part in pairs(activeTokens) do keys[#keys + 1] = part end
+    prunePriorityList()
 
-    local best, bestDist
-    for _, part in ipairs(keys) do
-        local tokenId = activeTokens[part]
-        if tokenId
-        and part.Parent
-        and not skipTokens[part]
-        and selectedTokens[tokenId]
-        and isInAnySelectedField(part.Position) then
-            local d = (part.Position - fromPos).Magnitude
-            if not bestDist or d < bestDist then
-                best, bestDist = part, d
-            end
-        end
-    end
-    return best
+    local entry = priorityList[1]
+    return entry and entry.part or nil
 end
 
 --=============================================================
@@ -809,12 +888,15 @@ task.spawn(function()
             local hum  = char and char:FindFirstChildOfClass("Humanoid")
 
             if hrp and hum and hum.Health > 0 then
-                local target = findNearest(hrp.Position)
+                local target = pickTarget(hrp.Position)
 
                 if target and target.Parent then
-                    -- Consume BEFORE tweening so we never re-select.
+                    -- Consume: pop from head + mark permanently skipped.
                     skipTokens[target] = true
                     activeTokens[target] = nil
+                    if #priorityList > 0 and priorityList[1].part == target then
+                        table.remove(priorityList, 1)
+                    end
 
                     local dist = (target.Position - hrp.Position).Magnitude
                     if dist > 0.5 then

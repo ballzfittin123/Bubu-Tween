@@ -1,0 +1,165 @@
+-- ═══════════════════════════════════════════════════════════════
+-- Bee Swarm Simulator – Auto Fast Tween to Specific Asset
+-- (fully automatic + bounding box with infinite Y)
+-- ═══════════════════════════════════════════════════════════════
+
+local Players      = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- ──────────────────────────────────────────────────────────────
+-- Configuration
+-- ──────────────────────────────────────────────────────────────
+local TARGET_ASSET_ID = "rbxassetid://1952740625"
+local TWEEN_TIME      = 0.1      -- seconds per tween (ultra-fast)
+local HOVER_HEIGHT    = 3        -- studs above the token
+local SEARCH_FOLDERS  = {"Collectibles", "Tokens"}
+local POLL_INTERVAL   = 0.1      -- seconds between scans
+
+-- Bounding box (Y is infinite → any height)
+local BOUND_CENTER   = Vector3.new(-178.1749725341797, 18.132238388061523, -9.854988098144531)
+local BOUND_HALF_X   = 89.64999389648438  / 2
+local BOUND_HALF_Z   = 106.29002380371094 / 2
+
+local function isInBounds(position)
+    return math.abs(position.X - BOUND_CENTER.X) <= BOUND_HALF_X
+       and math.abs(position.Z - BOUND_CENTER.Z) <= BOUND_HALF_Z
+    -- Y is intentionally ignored → "any y height"
+end
+
+-- ──────────────────────────────────────────────────────────────
+-- Weak-keyed skip set:
+--   • every token present at startup (initial scan)
+--   • every token already targeted by the loop
+-- Entries auto-clean when the token is destroyed.
+-- ──────────────────────────────────────────────────────────────
+local skipTokens = setmetatable({}, {__mode = "k"})
+
+-- ──────────────────────────────────────────────────────────────
+-- Helpers
+-- ──────────────────────────────────────────────────────────────
+
+local function getCharacter()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not root then return nil end
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return nil end
+    return char, root, humanoid
+end
+
+local function hasTargetAsset(part)
+    if part:IsA("MeshPart") and part.MeshId == TARGET_ASSET_ID then
+        return true
+    end
+    local texture = part:FindFirstChildOfClass("Texture")
+    if texture and texture.Texture == TARGET_ASSET_ID then
+        return true
+    end
+    local decal = part:FindFirstChildOfClass("Decal")
+    if decal and decal.Texture == TARGET_ASSET_ID then
+        return true
+    end
+    local specialMesh = part:FindFirstChildOfClass("SpecialMesh")
+    if specialMesh and specialMesh.MeshId == TARGET_ASSET_ID then
+        return true
+    end
+    return false
+end
+
+-- Decide where to scan (once at startup)
+local scanRoots = {}
+for _, name in ipairs(SEARCH_FOLDERS) do
+    local folder = workspace:FindFirstChild(name)
+    if folder then table.insert(scanRoots, folder) end
+end
+if #scanRoots == 0 then
+    scanRoots = {workspace}   -- fallback if the folders aren't found
+end
+
+local function findTargetParts()
+    local matches = {}
+    for _, root in ipairs(scanRoots) do
+        if root.Parent then
+            for _, obj in ipairs(root:GetDescendants()) do
+                if obj:IsA("BasePart")
+                   and isInBounds(obj.Position)
+                   and hasTargetAsset(obj)
+                then
+                    table.insert(matches, obj)
+                end
+            end
+        end
+    end
+    return matches
+end
+
+local function getClosestPart(parts, rootPart)
+    local closest, shortest = nil, math.huge
+    for _, part in ipairs(parts) do
+        local d = (rootPart.Position - part.Position).Magnitude
+        if d < shortest then
+            shortest = d
+            closest  = part
+        end
+    end
+    return closest
+end
+
+local function tweenToPart(targetPart)
+    local _, root, humanoid = getCharacter()
+    if not root or not humanoid or not targetPart.Parent then return end
+
+    humanoid:ChangeState(Enum.HumanoidStateType.Physics)
+
+    local targetCFrame = CFrame.new(targetPart.Position + Vector3.new(0, HOVER_HEIGHT, 0))
+    local info  = TweenInfo.new(TWEEN_TIME, Enum.EasingStyle.Linear, Enum.EasingDirection.Out)
+    local tween = TweenService:Create(root, info, {CFrame = targetCFrame})
+
+    tween:Play()
+    tween.Completed:Wait()
+
+    humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+end
+
+-- ──────────────────────────────────────────────────────────────
+-- Initial scan (runs once at startup, synchronously)
+-- ──────────────────────────────────────────────────────────────
+do
+    local existing = findTargetParts()
+    for _, token in ipairs(existing) do
+        skipTokens[token] = true
+    end
+    print(("[AutoTween] Initial scan blacklisted %d in-bounds token(s).")
+        :format(#existing))
+end
+
+-- ──────────────────────────────────────────────────────────────
+-- Automatic main loop (no key press required)
+-- ──────────────────────────────────────────────────────────────
+task.spawn(function()
+    while true do
+        task.wait(POLL_INTERVAL)
+
+        local _, root = getCharacter()
+        if root then
+            -- Gather fresh, in-bounds, non-skipped tokens
+            local candidates = {}
+            for _, token in ipairs(findTargetParts()) do
+                if not skipTokens[token] then
+                    table.insert(candidates, token)
+                end
+            end
+
+            if #candidates > 0 then
+                local closest = getClosestPart(candidates, root)
+                if closest then
+                    skipTokens[closest] = true   -- don't re-target it
+                    tweenToPart(closest)
+                end
+            end
+        end
+    end
+end)

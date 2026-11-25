@@ -1,12 +1,13 @@
 --=============================================================
---  Common Token Tween Script
+--  Jelly's Legit Script
 --  LocalScript -> StarterPlayer > StarterPlayerScripts
---  Event-driven scanning + tween-once + token-type multi-select.
+--  Event-driven scanning | tween-once | multi-select | persistence
 --=============================================================
 
 local Players          = game:GetService("Players")
 local TweenService     = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
+local HttpService      = game:GetService("HttpService")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
@@ -19,8 +20,9 @@ local TOKEN_IDS = {
     [1952740625] = "Strawberry",
     [1952682401] = "Sunflower Seed",
     [1952796032] = "Pineapple",
+    [3012679515] = "Coconut",
 }
-local TOKEN_ORDER = { 2028453802, 1952740625, 1952682401, 1952796032 }
+local TOKEN_ORDER = { 2028453802, 1952740625, 1952682401, 1952796032, 3012679515 }
 
 local FIELDS = {
     ["Sunflower"]  = { Vector2.new(-255, 246),  Vector2.new(-167, 103) },
@@ -33,9 +35,10 @@ local FIELDS = {
 local FIELD_ORDER = { "Sunflower", "Strawberry", "Pine tree", "Coconut", "Pepper", "Pineapple" }
 
 local SEARCH_FOLDERS       = { "Collectibles", "Tokens" }
-local MIN_TWEEN, MAX_TWEEN = 0.05, 0.30
+local MIN_TWEEN, MAX_TWEEN = 0.05, 0.50
 local INITIAL_SCAN_DELAY   = 1.0
 local POLL_INTERVAL        = 0.1
+local CONFIG_PATH          = "JellysLegitScript_config.json"
 
 --=============================================================
 -- STATE
@@ -43,11 +46,14 @@ local POLL_INTERVAL        = 0.1
 local state = {
     running   = false,
     tweenTime = 0.10,
-    field     = "Sunflower",
     minimized = false,
 }
 
--- Per-token-type selection (true = allowed). Defaults to all enabled.
+local selectedFields = {}
+for _, name in ipairs(FIELD_ORDER) do
+    selectedFields[name] = true
+end
+
 local selectedTokens = {}
 for _, id in ipairs(TOKEN_ORDER) do
     selectedTokens[id] = true
@@ -56,12 +62,8 @@ end
 local currentTween    = nil
 local exclusionsReady = false
 
--- Never-tween set (initial snapshot + consumed). Weak-keyed so a
--- destroyed instance's entry auto-clears and a respawned one is eligible.
 local skipTokens = setmetatable({}, { __mode = "k" })
-
--- Live tracked tokens: [BasePart] = tokenId
-local activeTokens = {}
+local activeTokens = {}  -- [BasePart] = tokenId
 
 --=============================================================
 -- UTILITIES
@@ -88,7 +90,7 @@ local function fieldBounds(name)
 end
 
 --=============================================================
--- TOKEN DETECTION  (returns matching tokenId, or nil)
+-- TOKEN DETECTION
 --=============================================================
 local function getTokenId(part)
     if not part or not part:IsA("BasePart") then return nil end
@@ -124,26 +126,108 @@ local function getTokenId(part)
 end
 
 --=============================================================
+-- PERSISTENCE  (uses executor writefile/readfile; silent no-op in Studio)
+--=============================================================
+local function canSave()
+    return type(writefile) == "function" and type(readfile) == "function"
+end
+
+local function fileExists()
+    if type(isfile) == "function" then
+        return isfile(CONFIG_PATH)
+    end
+    return false
+end
+
+local function loadConfig()
+    if not canSave() or not fileExists() then return end
+    local ok, content = pcall(readfile, CONFIG_PATH)
+    if not ok or type(content) ~= "string" then return end
+    local ok2, data = pcall(function()
+        return HttpService:JSONDecode(content)
+    end)
+    if not ok2 or type(data) ~= "table" then return end
+
+    if type(data.enabled) == "boolean" then
+        state.running = data.enabled
+    end
+    if type(data.tweenTime) == "number" then
+        state.tweenTime = math.clamp(data.tweenTime, MIN_TWEEN, MAX_TWEEN)
+    end
+    if type(data.fields) == "table" then
+        for name, val in pairs(data.fields) do
+            if FIELDS[name] and type(val) == "boolean" then
+                selectedFields[name] = val
+            end
+        end
+    end
+    if type(data.tokens) == "table" then
+        for idStr, val in pairs(data.tokens) do
+            local id = tonumber(idStr)
+            if id and TOKEN_IDS[id] and type(val) == "boolean" then
+                selectedTokens[id] = val
+            end
+        end
+    end
+end
+
+local function saveConfig()
+    if not canSave() then return end
+    local tokenMap = {}
+    for id, val in pairs(selectedTokens) do
+        tokenMap[tostring(id)] = val
+    end
+    local data = {
+        enabled   = state.running,
+        tweenTime = state.tweenTime,
+        fields    = selectedFields,
+        tokens    = tokenMap,
+    }
+    local ok, encoded = pcall(function()
+        return HttpService:JSONEncode(data)
+    end)
+    if not ok then return end
+    pcall(writefile, CONFIG_PATH, encoded)
+end
+
+loadConfig()
+
+--=============================================================
 -- GUI
 --=============================================================
 local gui = new("ScreenGui", {
-    Name = "CommonTokenTweener",
+    Name = "JellysLegitScript",
     ResetOnSpawn = false,
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 }, PlayerGui)
 
 local main = new("Frame", {
-    Size = UDim2.fromOffset(240, 220),
+    Size = UDim2.fromOffset(240, 216),
     Position = UDim2.new(0, 40, 0, 100),
-    BackgroundColor3 = Color3.fromRGB(28, 28, 34),
+    BackgroundColor3 = Color3.fromRGB(24, 20, 32),
     BorderSizePixel = 0,
 }, gui)
 new("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
-new("UIStroke", { Color = Color3.fromRGB(70, 70, 84), Thickness = 1 }, main)
 
+-- Animated purple gradient stroke (dynamic outline)
+local mainStroke = new("UIStroke", {
+    Thickness = 2,
+    Color = Color3.fromRGB(150, 70, 255),
+    ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+}, main)
+local mainGrad = new("UIGradient", {
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0,   Color3.fromRGB(200, 120, 255)),
+        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(110, 40, 220)),
+        ColorSequenceKeypoint.new(1,   Color3.fromRGB(180, 90, 255)),
+    }),
+    Rotation = 0,
+}, mainStroke)
+
+-- Title bar
 local titleBar = new("Frame", {
     Size = UDim2.new(1, 0, 0, 28),
-    BackgroundColor3 = Color3.fromRGB(42, 42, 52),
+    BackgroundColor3 = Color3.fromRGB(40, 30, 55),
     BorderSizePixel = 0,
 }, main)
 new("UICorner", { CornerRadius = UDim.new(0, 10) }, titleBar)
@@ -152,8 +236,8 @@ new("TextLabel", {
     Size = UDim2.new(1, -50, 1, 0),
     Position = UDim2.fromOffset(10, 0),
     BackgroundTransparency = 1,
-    Text = "Common Token Tween Script",
-    TextColor3 = Color3.fromRGB(235, 235, 245),
+    Text = "Jelly's Legit Script",
+    TextColor3 = Color3.fromRGB(235, 225, 255),
     TextSize = 13,
     Font = Enum.Font.GothamBold,
     TextXAlignment = Enum.TextXAlignment.Left,
@@ -164,18 +248,19 @@ local minBtn = new("TextButton", {
     Position = UDim2.new(1, -26, 0, 3),
     BackgroundTransparency = 1,
     Text = "–",
-    TextColor3 = Color3.fromRGB(200, 200, 210),
+    TextColor3 = Color3.fromRGB(210, 190, 255),
     TextSize = 16,
     Font = Enum.Font.GothamBold,
     AutoButtonColor = false,
 }, titleBar)
 
+-- Mini button (minimized)
 local miniBtn = new("TextButton", {
     Size = UDim2.fromOffset(44, 44),
     Position = main.Position,
-    BackgroundColor3 = Color3.fromRGB(42, 42, 52),
-    Text = "CT",
-    TextColor3 = Color3.fromRGB(235, 235, 245),
+    BackgroundColor3 = Color3.fromRGB(40, 30, 55),
+    Text = "JL",
+    TextColor3 = Color3.fromRGB(235, 225, 255),
     TextSize = 14,
     Font = Enum.Font.GothamBold,
     AutoButtonColor = false,
@@ -183,7 +268,14 @@ local miniBtn = new("TextButton", {
     Visible = false,
 }, gui)
 new("UICorner", { CornerRadius = UDim.new(1, 0) }, miniBtn)
-new("UIStroke", { Color = Color3.fromRGB(90, 160, 255), Thickness = 1 }, miniBtn)
+local miniStroke = new("UIStroke", {
+    Thickness = 2,
+    Color = Color3.fromRGB(150, 70, 255),
+}, miniBtn)
+local miniGrad = new("UIGradient", {
+    Color = mainGrad.Color,
+    Rotation = 0,
+}, miniStroke)
 
 -- Main Switch
 new("TextLabel", {
@@ -191,7 +283,7 @@ new("TextLabel", {
     Position = UDim2.fromOffset(10, 36),
     BackgroundTransparency = 1,
     Text = "Main Switch",
-    TextColor3 = Color3.fromRGB(215, 215, 225),
+    TextColor3 = Color3.fromRGB(215, 205, 240),
     TextSize = 13,
     Font = Enum.Font.Gotham,
     TextXAlignment = Enum.TextXAlignment.Left,
@@ -200,9 +292,9 @@ new("TextLabel", {
 local switchBtn = new("TextButton", {
     Size = UDim2.fromOffset(56, 24),
     Position = UDim2.new(1, -66, 0, 36),
-    BackgroundColor3 = Color3.fromRGB(60, 60, 72),
+    BackgroundColor3 = Color3.fromRGB(60, 50, 80),
     Text = "OFF",
-    TextColor3 = Color3.fromRGB(235, 235, 245),
+    TextColor3 = Color3.fromRGB(235, 225, 255),
     TextSize = 12,
     Font = Enum.Font.GothamBold,
     AutoButtonColor = false,
@@ -210,13 +302,101 @@ local switchBtn = new("TextButton", {
 }, main)
 new("UICorner", { CornerRadius = UDim.new(0, 6) }, switchBtn)
 
--- Tween Time slider
-local tweenLabel = new("TextLabel", {
+-- Field Select (multi)
+new("TextLabel", {
     Size = UDim2.new(1, -20, 0, 18),
     Position = UDim2.fromOffset(10, 68),
     BackgroundTransparency = 1,
+    Text = "Field Select",
+    TextColor3 = Color3.fromRGB(215, 205, 240),
+    TextSize = 13,
+    Font = Enum.Font.Gotham,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, main)
+
+local fieldBtn = new("TextButton", {
+    Size = UDim2.new(1, -20, 0, 26),
+    Position = UDim2.fromOffset(10, 86),
+    BackgroundColor3 = Color3.fromRGB(55, 45, 75),
+    Text = "",
+    AutoButtonColor = false,
+    BorderSizePixel = 0,
+}, main)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, fieldBtn)
+
+local fieldBtnLabel = new("TextLabel", {
+    Size = UDim2.new(1, -20, 1, 0),
+    Position = UDim2.fromOffset(10, 0),
+    BackgroundTransparency = 1,
+    Text = "",
+    TextColor3 = Color3.fromRGB(235, 225, 255),
+    TextSize = 13,
+    Font = Enum.Font.Gotham,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, fieldBtn)
+
+local fieldDropdown = new("Frame", {
+    Size = UDim2.new(1, -20, 0, #FIELD_ORDER * 24),
+    Position = UDim2.fromOffset(10, 112),
+    BackgroundColor3 = Color3.fromRGB(35, 28, 48),
+    BorderSizePixel = 0,
+    Visible = false,
+    ZIndex = 5,
+}, main)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, fieldDropdown)
+new("UIStroke", { Thickness = 1, Color = Color3.fromRGB(120, 60, 200) }, fieldDropdown)
+
+-- Token Select (multi)
+new("TextLabel", {
+    Size = UDim2.new(1, -20, 0, 18),
+    Position = UDim2.fromOffset(10, 120),
+    BackgroundTransparency = 1,
+    Text = "Token Select",
+    TextColor3 = Color3.fromRGB(215, 205, 240),
+    TextSize = 13,
+    Font = Enum.Font.Gotham,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, main)
+
+local tokenBtn = new("TextButton", {
+    Size = UDim2.new(1, -20, 0, 26),
+    Position = UDim2.fromOffset(10, 138),
+    BackgroundColor3 = Color3.fromRGB(55, 45, 75),
+    Text = "",
+    AutoButtonColor = false,
+    BorderSizePixel = 0,
+}, main)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, tokenBtn)
+
+local tokenBtnLabel = new("TextLabel", {
+    Size = UDim2.new(1, -20, 1, 0),
+    Position = UDim2.fromOffset(10, 0),
+    BackgroundTransparency = 1,
+    Text = "",
+    TextColor3 = Color3.fromRGB(235, 225, 255),
+    TextSize = 13,
+    Font = Enum.Font.Gotham,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, tokenBtn)
+
+local tokenDropdown = new("Frame", {
+    Size = UDim2.new(1, -20, 0, #TOKEN_ORDER * 24),
+    Position = UDim2.fromOffset(10, 164),
+    BackgroundColor3 = Color3.fromRGB(35, 28, 48),
+    BorderSizePixel = 0,
+    Visible = false,
+    ZIndex = 5,
+}, main)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, tokenDropdown)
+new("UIStroke", { Thickness = 1, Color = Color3.fromRGB(120, 60, 200) }, tokenDropdown)
+
+-- Tween time
+local tweenLabel = new("TextLabel", {
+    Size = UDim2.new(1, -20, 0, 18),
+    Position = UDim2.fromOffset(10, 172),
+    BackgroundTransparency = 1,
     Text = "Tween Time: 0.10",
-    TextColor3 = Color3.fromRGB(215, 215, 225),
+    TextColor3 = Color3.fromRGB(215, 205, 240),
     TextSize = 13,
     Font = Enum.Font.Gotham,
     TextXAlignment = Enum.TextXAlignment.Left,
@@ -224,7 +404,7 @@ local tweenLabel = new("TextLabel", {
 
 local sliderArea = new("Frame", {
     Size = UDim2.new(1, -20, 0, 16),
-    Position = UDim2.fromOffset(10, 88),
+    Position = UDim2.fromOffset(10, 192),
     BackgroundTransparency = 1,
 }, main)
 
@@ -232,14 +412,14 @@ local track = new("Frame", {
     Size = UDim2.new(1, 0, 0, 6),
     Position = UDim2.new(0, 0, 0.5, 0),
     AnchorPoint = Vector2.new(0, 0.5),
-    BackgroundColor3 = Color3.fromRGB(58, 58, 70),
+    BackgroundColor3 = Color3.fromRGB(55, 45, 75),
     BorderSizePixel = 0,
 }, sliderArea)
 new("UICorner", { CornerRadius = UDim.new(1, 0) }, track)
 
 local fill = new("Frame", {
     Size = UDim2.new(0, 0, 1, 0),
-    BackgroundColor3 = Color3.fromRGB(90, 160, 255),
+    BackgroundColor3 = Color3.fromRGB(150, 80, 255),
     BorderSizePixel = 0,
 }, track)
 new("UICorner", { CornerRadius = UDim.new(1, 0) }, fill)
@@ -248,7 +428,7 @@ local knob = new("Frame", {
     Size = UDim2.fromOffset(12, 12),
     AnchorPoint = Vector2.new(0.5, 0.5),
     Position = UDim2.new(0, 0, 0.5, 0),
-    BackgroundColor3 = Color3.fromRGB(240, 240, 250),
+    BackgroundColor3 = Color3.fromRGB(240, 230, 255),
     BorderSizePixel = 0,
 }, sliderArea)
 new("UICorner", { CornerRadius = UDim.new(1, 0) }, knob)
@@ -277,8 +457,9 @@ sliderArea.InputBegan:Connect(function(input)
         sliding = true
         applySliderInput(input)
         input.Changed:Connect(function()
-            if input.UserInputState == Enum.UserInputState.End then
+            if input.UserInputState == Enum.UserInputState.End and sliding then
                 sliding = false
+                saveConfig()
             end
         end)
     end
@@ -291,90 +472,21 @@ UserInputService.InputChanged:Connect(function(input)
     end
 end)
 
--- Field Select (single-select)
-new("TextLabel", {
-    Size = UDim2.new(1, -20, 0, 18),
-    Position = UDim2.fromOffset(10, 110),
-    BackgroundTransparency = 1,
-    Text = "Field Select",
-    TextColor3 = Color3.fromRGB(215, 215, 225),
-    TextSize = 13,
-    Font = Enum.Font.Gotham,
-    TextXAlignment = Enum.TextXAlignment.Left,
-}, main)
+-- Dropdown open/close helpers
+local function closeAllDropdowns()
+    fieldDropdown.Visible = false
+    tokenDropdown.Visible = false
+end
 
-local fieldBtn = new("TextButton", {
-    Size = UDim2.new(1, -20, 0, 26),
-    Position = UDim2.fromOffset(10, 130),
-    BackgroundColor3 = Color3.fromRGB(55, 55, 68),
-    Text = state.field .. "   v",
-    TextColor3 = Color3.fromRGB(235, 235, 245),
-    TextSize = 13,
-    Font = Enum.Font.Gotham,
-    AutoButtonColor = false,
-    BorderSizePixel = 0,
-}, main)
-new("UICorner", { CornerRadius = UDim.new(0, 6) }, fieldBtn)
+-- Button label refresh
+local function refreshFieldBtnLabel()
+    local count = 0
+    for _, name in ipairs(FIELD_ORDER) do
+        if selectedFields[name] then count = count + 1 end
+    end
+    fieldBtnLabel.Text = string.format("Fields (%d/%d)   v", count, #FIELD_ORDER)
+end
 
-local fieldDropdown = new("Frame", {
-    Size = UDim2.new(1, -20, 0, #FIELD_ORDER * 24),
-    Position = UDim2.fromOffset(10, 158),
-    BackgroundColor3 = Color3.fromRGB(40, 40, 50),
-    BorderSizePixel = 0,
-    Visible = false,
-    ZIndex = 5,
-}, main)
-new("UICorner", { CornerRadius = UDim.new(0, 6) }, fieldDropdown)
-new("UIStroke", { Color = Color3.fromRGB(80, 80, 95), Thickness = 1 }, fieldDropdown)
-
--- Token Select (multi-select)
-new("TextLabel", {
-    Size = UDim2.new(1, -20, 0, 18),
-    Position = UDim2.fromOffset(10, 164),
-    BackgroundTransparency = 1,
-    Text = "Token Select",
-    TextColor3 = Color3.fromRGB(215, 215, 225),
-    TextSize = 13,
-    Font = Enum.Font.Gotham,
-    TextXAlignment = Enum.TextXAlignment.Left,
-}, main)
-
-local tokenBtn = new("TextButton", {
-    Size = UDim2.new(1, -20, 0, 26),
-    Position = UDim2.fromOffset(10, 184),
-    BackgroundColor3 = Color3.fromRGB(55, 55, 68),
-    Text = "",
-    TextColor3 = Color3.fromRGB(235, 235, 245),
-    TextSize = 13,
-    Font = Enum.Font.Gotham,
-    AutoButtonColor = false,
-    BorderSizePixel = 0,
-}, main)
-new("UICorner", { CornerRadius = UDim.new(0, 6) }, tokenBtn)
-
-local tokenBtnLabel = new("TextLabel", {
-    Size = UDim2.new(1, -20, 1, 0),
-    Position = UDim2.fromOffset(10, 0),
-    BackgroundTransparency = 1,
-    Text = "",
-    TextColor3 = Color3.fromRGB(235, 235, 245),
-    TextSize = 13,
-    Font = Enum.Font.Gotham,
-    TextXAlignment = Enum.TextXAlignment.Left,
-}, tokenBtn)
-
-local tokenDropdown = new("Frame", {
-    Size = UDim2.new(1, -20, 0, #TOKEN_ORDER * 24),
-    Position = UDim2.fromOffset(10, 212),
-    BackgroundColor3 = Color3.fromRGB(40, 40, 50),
-    BorderSizePixel = 0,
-    Visible = false,
-    ZIndex = 5,
-}, main)
-new("UICorner", { CornerRadius = UDim.new(0, 6) }, tokenDropdown)
-new("UIStroke", { Color = Color3.fromRGB(80, 80, 95), Thickness = 1 }, tokenDropdown)
-
--- Refresh the token-button label to show "N/M selected".
 local function refreshTokenBtnLabel()
     local count = 0
     for _, id in ipairs(TOKEN_ORDER) do
@@ -382,63 +494,31 @@ local function refreshTokenBtnLabel()
     end
     tokenBtnLabel.Text = string.format("Tokens (%d/%d)   v", count, #TOKEN_ORDER)
 end
+refreshFieldBtnLabel()
 refreshTokenBtnLabel()
 
--- Close the other dropdown whenever one opens.
-local function closeAllDropdowns()
-    fieldDropdown.Visible = false
-    tokenDropdown.Visible = false
-end
-
--- Build field dropdown items
-for i, name in ipairs(FIELD_ORDER) do
+-- Checkbox row factory
+local function makeCheckboxRow(parent, yPos, labelText, getSelected, setSelected)
     local item = new("TextButton", {
         Size = UDim2.new(1, 0, 0, 24),
-        Position = UDim2.fromOffset(0, (i - 1) * 24),
+        Position = UDim2.fromOffset(0, yPos),
         BackgroundTransparency = 1,
-        BackgroundColor3 = Color3.fromRGB(90, 160, 255),
-        Text = name,
-        TextColor3 = Color3.fromRGB(225, 225, 235),
-        TextSize = 13,
-        Font = Enum.Font.Gotham,
-        AutoButtonColor = false,
-        BorderSizePixel = 0,
-        ZIndex = 6,
-    }, fieldDropdown)
-    item.MouseButton1Click:Connect(function()
-        state.field = name
-        fieldBtn.Text = name .. "   v"
-        closeAllDropdowns()
-    end)
-    item.MouseEnter:Connect(function() item.BackgroundTransparency = 0.85 end)
-    item.MouseLeave:Connect(function() item.BackgroundTransparency = 1 end)
-end
-
--- Build token dropdown items (checkbox + label per type)
-for i, tokenId in ipairs(TOKEN_ORDER) do
-    local y = (i - 1) * 24
-    local name = TOKEN_IDS[tokenId]
-
-    local item = new("TextButton", {
-        Size = UDim2.new(1, 0, 0, 24),
-        Position = UDim2.fromOffset(0, y),
-        BackgroundTransparency = 1,
-        BackgroundColor3 = Color3.fromRGB(90, 160, 255),
+        BackgroundColor3 = Color3.fromRGB(150, 80, 255),
         Text = "",
         AutoButtonColor = false,
         BorderSizePixel = 0,
         ZIndex = 6,
-    }, tokenDropdown)
+    }, parent)
 
     local checkBox = new("Frame", {
         Size = UDim2.fromOffset(14, 14),
         Position = UDim2.fromOffset(10, 5),
-        BackgroundColor3 = Color3.fromRGB(90, 160, 255),
+        BackgroundColor3 = Color3.fromRGB(55, 45, 75),
         BorderSizePixel = 0,
         ZIndex = 7,
     }, item)
     new("UICorner", { CornerRadius = UDim.new(0, 3) }, checkBox)
-    new("UIStroke", { Color = Color3.fromRGB(120, 120, 140), Thickness = 1 }, checkBox)
+    new("UIStroke", { Color = Color3.fromRGB(120, 60, 200), Thickness = 1 }, checkBox)
 
     local checkMark = new("TextLabel", {
         Size = UDim2.fromScale(1, 1),
@@ -448,38 +528,59 @@ for i, tokenId in ipairs(TOKEN_ORDER) do
         TextSize = 11,
         Font = Enum.Font.GothamBold,
         ZIndex = 8,
+        Visible = false,
     }, checkBox)
 
     new("TextLabel", {
         Size = UDim2.new(1, -32, 1, 0),
         Position = UDim2.fromOffset(32, 0),
         BackgroundTransparency = 1,
-        Text = name,
-        TextColor3 = Color3.fromRGB(225, 225, 235),
+        Text = labelText,
+        TextColor3 = Color3.fromRGB(225, 215, 245),
         TextSize = 13,
         Font = Enum.Font.Gotham,
         TextXAlignment = Enum.TextXAlignment.Left,
         ZIndex = 7,
     }, item)
 
-    local function refreshCheck()
-        if selectedTokens[tokenId] then
-            checkBox.BackgroundColor3 = Color3.fromRGB(90, 160, 255)
+    local function refresh()
+        if getSelected() then
+            checkBox.BackgroundColor3 = Color3.fromRGB(150, 80, 255)
             checkMark.Visible = true
         else
-            checkBox.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+            checkBox.BackgroundColor3 = Color3.fromRGB(55, 45, 75)
             checkMark.Visible = false
         end
     end
-    refreshCheck()
+    refresh()
 
     item.MouseButton1Click:Connect(function()
-        selectedTokens[tokenId] = not selectedTokens[tokenId]
-        refreshCheck()
-        refreshTokenBtnLabel()
+        setSelected(not getSelected())
+        refresh()
+        saveConfig()
     end)
     item.MouseEnter:Connect(function() item.BackgroundTransparency = 0.85 end)
     item.MouseLeave:Connect(function() item.BackgroundTransparency = 1 end)
+end
+
+for i, name in ipairs(FIELD_ORDER) do
+    makeCheckboxRow(
+        fieldDropdown,
+        (i - 1) * 24,
+        name,
+        function() return selectedFields[name] end,
+        function(v) selectedFields[name] = v; refreshFieldBtnLabel() end
+    )
+end
+
+for i, tokenId in ipairs(TOKEN_ORDER) do
+    makeCheckboxRow(
+        tokenDropdown,
+        (i - 1) * 24,
+        TOKEN_IDS[tokenId],
+        function() return selectedTokens[tokenId] end,
+        function(v) selectedTokens[tokenId] = v; refreshTokenBtnLabel() end
+    )
 end
 
 fieldBtn.MouseButton1Click:Connect(function()
@@ -494,9 +595,7 @@ tokenBtn.MouseButton1Click:Connect(function()
     tokenDropdown.Visible = not wasOpen
 end)
 
---=============================================================
--- MINIMIZE
---=============================================================
+-- Minimize
 local function setMinimized(v)
     state.minimized = v
     closeAllDropdowns()
@@ -514,9 +613,7 @@ end
 minBtn.MouseButton1Click:Connect(function() setMinimized(true) end)
 miniBtn.MouseButton1Click:Connect(function() setMinimized(false) end)
 
---=============================================================
--- DRAG
---=============================================================
+-- Drag
 local function makeDraggable(handle, target)
     local dragging, dragStart, startPos
     handle.InputBegan:Connect(function(input)
@@ -546,16 +643,14 @@ end
 makeDraggable(titleBar, main)
 makeDraggable(miniBtn, miniBtn)
 
---=============================================================
--- MAIN SWITCH
---=============================================================
+-- Switch
 local function refreshSwitch()
     if state.running then
         switchBtn.Text = "ON"
-        switchBtn.BackgroundColor3 = Color3.fromRGB(56, 168, 96)
+        switchBtn.BackgroundColor3 = Color3.fromRGB(90, 200, 120)
     else
         switchBtn.Text = "OFF"
-        switchBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 72)
+        switchBtn.BackgroundColor3 = Color3.fromRGB(60, 50, 80)
     end
 end
 refreshSwitch()
@@ -567,6 +662,24 @@ switchBtn.MouseButton1Click:Connect(function()
         currentTween = nil
     end
     refreshSwitch()
+    saveConfig()
+end)
+
+--=============================================================
+-- DYNAMIC PURPLE OUTLINE ANIMATION
+--=============================================================
+task.spawn(function()
+    local t = 0
+    while gui.Parent do
+        local dt = task.wait(0.03)
+        t = t + dt
+        local rot = (t * 90) % 360
+        mainGrad.Rotation = rot
+        miniGrad.Rotation = rot
+        local thick = 2 + math.sin(t * 2.5) * 0.6
+        mainStroke.Thickness = thick
+        miniStroke.Thickness = thick
+    end
 end)
 
 --=============================================================
@@ -628,7 +741,6 @@ task.spawn(function()
     if not game:IsLoaded() then game.Loaded:Wait() end
     task.wait(INITIAL_SCAN_DELAY)
 
-    -- Hook first so nothing spawned during the snapshot is missed.
     for _, root in ipairs(scanRoots) do
         root.DescendantAdded:Connect(considerDescendant)
     end
@@ -640,7 +752,7 @@ task.spawn(function()
     end
     exclusionsReady = true
 
-    warn(("[CommonTokenTweener] Excluded %d initial token(s); roots: %s")
+    warn(("[Jelly's Legit Script] Ready. Excluded %d initial token(s); roots: %s")
         :format(#initial, table.concat(
             (function()
                 local names = {}
@@ -650,9 +762,22 @@ task.spawn(function()
 end)
 
 --=============================================================
--- NEAREST TOKEN  (filters by selection + bounds)
+-- POSITION FILTERS
 --=============================================================
-local function findNearest(fromPos, bounds)
+local function isInAnySelectedField(pos)
+    for name, enabled in pairs(selectedFields) do
+        if enabled then
+            local b = fieldBounds(name)
+            if pos.X >= b.minX and pos.X <= b.maxX
+            and pos.Z >= b.minZ and pos.Z <= b.maxZ then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function findNearest(fromPos)
     local keys = {}
     for part in pairs(activeTokens) do keys[#keys + 1] = part end
 
@@ -662,14 +787,11 @@ local function findNearest(fromPos, bounds)
         if tokenId
         and part.Parent
         and not skipTokens[part]
-        and selectedTokens[tokenId] then
-            local p = part.Position
-            if p.X >= bounds.minX and p.X <= bounds.maxX
-            and p.Z >= bounds.minZ and p.Z <= bounds.maxZ then
-                local d = (p - fromPos).Magnitude
-                if not bestDist or d < bestDist then
-                    best, bestDist = part, d
-                end
+        and selectedTokens[tokenId]
+        and isInAnySelectedField(part.Position) then
+            local d = (part.Position - fromPos).Magnitude
+            if not bestDist or d < bestDist then
+                best, bestDist = part, d
             end
         end
     end
@@ -687,10 +809,10 @@ task.spawn(function()
             local hum  = char and char:FindFirstChildOfClass("Humanoid")
 
             if hrp and hum and hum.Health > 0 then
-                local target = findNearest(hrp.Position, fieldBounds(state.field))
+                local target = findNearest(hrp.Position)
 
                 if target and target.Parent then
-                    -- Consume BEFORE tweening: never re-select this instance.
+                    -- Consume BEFORE tweening so we never re-select.
                     skipTokens[target] = true
                     activeTokens[target] = nil
 

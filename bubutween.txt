@@ -74,10 +74,9 @@ local skipTokens = setmetatable({}, { __mode = "k" })
 local activeTokens = {}
 
 -- Sorted priority list (closest first) — rebuilt only when stale.
--- Each entry: { part = BasePart, dist = number }
 local priorityList   = {}
 local priorityStale  = true
-local priorityOrigin = nil  -- Vector3 the list was sorted around
+local priorityOrigin = nil
 
 --=============================================================
 -- UTILITIES
@@ -619,7 +618,32 @@ local function setMinimized(v)
     end
 end
 minBtn.MouseButton1Click:Connect(function() setMinimized(true) end)
-miniBtn.MouseButton1Click:Connect(function() setMinimized(false) end)
+
+--=============================================================
+-- MINI BUTTON: drag-aware restore
+--  Track press position; only restore if the pointer moved less
+--  than DRAG_THRESHOLD pixels between press and release. This
+--  prevents "drag the mini button" from accidentally reopening
+--  the panel (since Roblox still fires MouseButton1Click even
+--  after a short drag).
+--=============================================================
+local miniPressPos = nil
+local DRAG_THRESHOLD = 4  -- pixels
+
+miniBtn.MouseButton1Down:Connect(function()
+    miniPressPos = UserInputService:GetMouseLocation()
+end)
+
+miniBtn.MouseButton1Click:Connect(function()
+    if miniPressPos then
+        local delta = (UserInputService:GetMouseLocation() - miniPressPos).Magnitude
+        miniPressPos = nil
+        if delta >= DRAG_THRESHOLD then
+            return  -- it was a drag, not a click
+        end
+    end
+    setMinimized(false)
+end)
 
 local function makeDraggable(handle, target)
     local dragging, dragStart, startPos
@@ -724,12 +748,9 @@ local function isEligible(part, info)
 end
 
 --=============================================================
--- PRIORITY LIST  (sorted closest-first around a reference origin)
---  Rebuild is O(n log n) but only runs when the list is stale
---  (new token added, selection changed, or player moved far
---  enough that relative ordering could shift).
+-- PRIORITY LIST
 --=============================================================
-local SORT_ORIGIN_TOLERANCE = 32  -- studs; beyond this, re-sort
+local SORT_ORIGIN_TOLERANCE = 32
 
 local function buildPriorityList(origin)
     local list = {}
@@ -749,13 +770,11 @@ local function buildPriorityList(origin)
     priorityStale  = false
 end
 
--- Insert a newly-tracked token into the sorted list without a full rebuild.
 local function insertIntoPriorityList(part, info, origin)
     if not origin then return end
     if not isEligible(part, info) then return end
 
     local entry = { part = part, dist = (part.Position - origin).Magnitude }
-    -- Binary search insertion point.
     local lo, hi = 1, #priorityList + 1
     while lo < hi do
         local mid = math.floor((lo + hi) / 2)
@@ -768,7 +787,6 @@ local function insertIntoPriorityList(part, info, origin)
     table.insert(priorityList, lo, entry)
 end
 
--- Remove dead/consumed entries from the head of the list.
 local function prunePriorityList()
     while #priorityList > 0 do
         local entry = priorityList[1]
@@ -808,7 +826,6 @@ local function trackPart(part)
 
     activeTokens[part] = info
 
-    -- Insert into priority list if we already have an origin.
     if priorityOrigin then
         insertIntoPriorityList(part, info, priorityOrigin)
     else
@@ -860,9 +877,6 @@ end)
 
 --=============================================================
 -- PICK NEXT TARGET
---  Walks the priority list from the closest entry outward. The
---  list is lazily rebuilt when stale or when the player has moved
---  far enough that its ordering may be wrong.
 --=============================================================
 local function pickTarget(origin)
     if priorityStale
@@ -891,7 +905,6 @@ task.spawn(function()
                 local target = pickTarget(hrp.Position)
 
                 if target and target.Parent then
-                    -- Consume: pop from head + mark permanently skipped.
                     skipTokens[target] = true
                     activeTokens[target] = nil
                     if #priorityList > 0 and priorityList[1].part == target then

@@ -50,9 +50,10 @@ local CONFIG_PATH          = "JellysLegitScript_config.json"
 -- STATE
 --=============================================================
 local state = {
-    running   = false,
-    tweenTime = 0.10,
-    minimized = false,
+    running       = false,
+    tweenTime     = 0.10,
+    minimized     = false,
+    onlyInField   = false,  -- "Only Tween In Field" toggle
 }
 
 local selectedFields = {}
@@ -159,6 +160,9 @@ local function loadConfig()
     if type(data.tweenTime) == "number" then
         state.tweenTime = math.clamp(data.tweenTime, MIN_TWEEN, MAX_TWEEN)
     end
+    if type(data.onlyInField) == "boolean" then
+        state.onlyInField = data.onlyInField
+    end
     if type(data.fields) == "table" then
         for name, val in pairs(data.fields) do
             if FIELDS[name] and type(val) == "boolean" then
@@ -190,11 +194,12 @@ local function saveConfig()
     for id, val in pairs(selectedTokens) do tokenMap[tostring(id)] = val end
     for id, val in pairs(selectedGlobals) do globalMap[tostring(id)] = val end
     local data = {
-        enabled   = state.running,
-        tweenTime = state.tweenTime,
-        fields    = selectedFields,
-        tokens    = tokenMap,
-        globals   = globalMap,
+        enabled     = state.running,
+        tweenTime   = state.tweenTime,
+        onlyInField = state.onlyInField,
+        fields      = selectedFields,
+        tokens      = tokenMap,
+        globals     = globalMap,
     }
     local ok, encoded = pcall(function() return HttpService:JSONEncode(data) end)
     if not ok then return end
@@ -212,8 +217,9 @@ local gui = new("ScreenGui", {
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 }, PlayerGui)
 
+-- Frame grew 32px taller for the new "Only Tween In Field" row.
 local main = new("Frame", {
-    Size = UDim2.fromOffset(240, 262),
+    Size = UDim2.fromOffset(240, 294),
     Position = UDim2.new(0, 40, 0, 100),
     BackgroundColor3 = Color3.fromRGB(24, 20, 32),
     BorderSizePixel = 0,
@@ -409,10 +415,32 @@ local globalDropdown = new("Frame", {
 new("UICorner", { CornerRadius = UDim.new(0, 6) }, globalDropdown)
 new("UIStroke", { Thickness = 1, Color = Color3.fromRGB(120, 60, 200) }, globalDropdown)
 
+-- Only Tween In Field toggle
+new("TextLabel", {
+    Size = UDim2.new(1, -70, 0, 24),
+    Position = UDim2.fromOffset(10, 222),
+    BackgroundTransparency = 1,
+    Text = "Only Tween In Field",
+    TextColor3 = Color3.fromRGB(215, 205, 240),
+    TextSize = 13, Font = Enum.Font.Gotham,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, main)
+
+local onlyFieldBtn = new("TextButton", {
+    Size = UDim2.fromOffset(56, 24),
+    Position = UDim2.new(1, -66, 0, 222),
+    BackgroundColor3 = Color3.fromRGB(60, 50, 80),
+    Text = "OFF",
+    TextColor3 = Color3.fromRGB(235, 225, 255),
+    TextSize = 12, Font = Enum.Font.GothamBold,
+    AutoButtonColor = false, BorderSizePixel = 0,
+}, main)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, onlyFieldBtn)
+
 -- Tween time
 local tweenLabel = new("TextLabel", {
     Size = UDim2.new(1, -20, 0, 18),
-    Position = UDim2.fromOffset(10, 218),
+    Position = UDim2.fromOffset(10, 250),
     BackgroundTransparency = 1,
     Text = "Tween Time: 0.10",
     TextColor3 = Color3.fromRGB(215, 205, 240),
@@ -422,7 +450,7 @@ local tweenLabel = new("TextLabel", {
 
 local sliderArea = new("Frame", {
     Size = UDim2.new(1, -20, 0, 16),
-    Position = UDim2.fromOffset(10, 238),
+    Position = UDim2.fromOffset(10, 270),
     BackgroundTransparency = 1,
 }, main)
 
@@ -604,6 +632,25 @@ globalBtn.MouseButton1Click:Connect(function()
     globalDropdown.Visible = not was
 end)
 
+-- Only Tween In Field toggle refresh + handler
+local function refreshOnlyFieldBtn()
+    if state.onlyInField then
+        onlyFieldBtn.Text = "ON"
+        onlyFieldBtn.BackgroundColor3 = Color3.fromRGB(90, 200, 120)
+    else
+        onlyFieldBtn.Text = "OFF"
+        onlyFieldBtn.BackgroundColor3 = Color3.fromRGB(60, 50, 80)
+    end
+end
+refreshOnlyFieldBtn()
+
+onlyFieldBtn.MouseButton1Click:Connect(function()
+    state.onlyInField = not state.onlyInField
+    refreshOnlyFieldBtn()
+    priorityStale = true
+    saveConfig()
+end)
+
 local function setMinimized(v)
     state.minimized = v
     closeAllDropdowns()
@@ -621,14 +668,9 @@ minBtn.MouseButton1Click:Connect(function() setMinimized(true) end)
 
 --=============================================================
 -- MINI BUTTON: drag-aware restore
---  Track press position; only restore if the pointer moved less
---  than DRAG_THRESHOLD pixels between press and release. This
---  prevents "drag the mini button" from accidentally reopening
---  the panel (since Roblox still fires MouseButton1Click even
---  after a short drag).
 --=============================================================
 local miniPressPos = nil
-local DRAG_THRESHOLD = 4  -- pixels
+local DRAG_THRESHOLD = 4
 
 miniBtn.MouseButton1Down:Connect(function()
     miniPressPos = UserInputService:GetMouseLocation()
@@ -639,7 +681,7 @@ miniBtn.MouseButton1Click:Connect(function()
         local delta = (UserInputService:GetMouseLocation() - miniPressPos).Magnitude
         miniPressPos = nil
         if delta >= DRAG_THRESHOLD then
-            return  -- it was a drag, not a click
+            return
         end
     end
     setMinimized(false)
@@ -723,7 +765,7 @@ end
 if #scanRoots == 0 then scanRoots = { workspace } end
 
 --=============================================================
--- ELIGIBILITY
+-- FIELD HELPERS
 --=============================================================
 local function isInAnySelectedField(pos)
     for name, enabled in pairs(selectedFields) do
@@ -738,13 +780,50 @@ local function isInAnySelectedField(pos)
     return false
 end
 
-local function isEligible(part, info)
+-- Returns the name of the first selected field containing pos, or nil.
+local function getFieldAt(pos)
+    for name, enabled in pairs(selectedFields) do
+        if enabled then
+            local b = fieldBounds(name)
+            if pos.X >= b.minX and pos.X <= b.maxX
+            and pos.Z >= b.minZ and pos.Z <= b.maxZ then
+                return name
+            end
+        end
+    end
+    return nil
+end
+
+--=============================================================
+-- ELIGIBILITY
+--  playerOrigin = current player HRP position (or nil).
+--  When onlyInField is ON, a field token is only eligible when
+--  the player is standing inside the SAME field as the token.
+--  Global tokens are never affected.
+--=============================================================
+local function isEligible(part, info, playerOrigin)
     if not info then return false end
     if info.global then
         return selectedGlobals[info.id] == true
     end
-    return selectedTokens[info.id] == true
-       and isInAnySelectedField(part.Position)
+    if selectedTokens[info.id] ~= true then
+        return false
+    end
+
+    local pos = part.Position
+    if not isInAnySelectedField(pos) then
+        return false
+    end
+
+    if state.onlyInField then
+        if not playerOrigin then return false end
+        local playerField = getFieldAt(playerOrigin)
+        if not playerField then return false end
+        local tokenField = getFieldAt(pos)
+        if tokenField ~= playerField then return false end
+    end
+
+    return true
 end
 
 --=============================================================
@@ -757,7 +836,7 @@ local function buildPriorityList(origin)
     for part, info in pairs(activeTokens) do
         if part.Parent
         and not skipTokens[part]
-        and isEligible(part, info) then
+        and isEligible(part, info, origin) then
             list[#list + 1] = {
                 part = part,
                 dist = (part.Position - origin).Magnitude,
@@ -772,7 +851,7 @@ end
 
 local function insertIntoPriorityList(part, info, origin)
     if not origin then return end
-    if not isEligible(part, info) then return end
+    if not isEligible(part, info, origin) then return end
 
     local entry = { part = part, dist = (part.Position - origin).Magnitude }
     local lo, hi = 1, #priorityList + 1
@@ -787,12 +866,15 @@ local function insertIntoPriorityList(part, info, origin)
     table.insert(priorityList, lo, entry)
 end
 
-local function prunePriorityList()
+local function prunePriorityList(playerOrigin)
     while #priorityList > 0 do
         local entry = priorityList[1]
         local part = entry.part
         local info = activeTokens[part]
-        if not part.Parent or not info or skipTokens[part] or not isEligible(part, info) then
+        if not part.Parent
+        or not info
+        or skipTokens[part]
+        or not isEligible(part, info, playerOrigin) then
             table.remove(priorityList, 1)
         else
             break
@@ -877,15 +959,29 @@ end)
 
 --=============================================================
 -- PICK NEXT TARGET
+--  Rebuilds when the list is stale OR when:
+--   - the player moved past SORT_ORIGIN_TOLERANCE, OR
+--   - onlyInField is ON and the player entered a different field
+--     (since eligibility may have changed for every token).
 --=============================================================
 local function pickTarget(origin)
-    if priorityStale
-    or not priorityOrigin
-    or (origin - priorityOrigin).Magnitude > SORT_ORIGIN_TOLERANCE then
+    local needRebuild = priorityStale
+        or not priorityOrigin
+        or (origin - priorityOrigin).Magnitude > SORT_ORIGIN_TOLERANCE
+
+    if not needRebuild and state.onlyInField then
+        local curField     = getFieldAt(origin)
+        local originField  = getFieldAt(priorityOrigin)
+        if curField ~= originField then
+            needRebuild = true
+        end
+    end
+
+    if needRebuild then
         buildPriorityList(origin)
     end
 
-    prunePriorityList()
+    prunePriorityList(origin)
 
     local entry = priorityList[1]
     return entry and entry.part or nil

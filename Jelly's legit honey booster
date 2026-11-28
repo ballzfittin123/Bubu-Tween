@@ -15,19 +15,31 @@ local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
 --=============================================================
 -- CONFIG
 --  Each "group" is a selectable row. A group can map to one or
---  more asset IDs (e.g. Bear Morph = 3 IDs toggled together).
+--  more asset IDs (e.g. Bear Morph = all IDs toggled together).
 --=============================================================
 local TOKEN_GROUPS = {
-    { name = "Festive Blessing", ids = { 2652424756 } },
-    { name = "Beesmas Cheer",    ids = { 2652364571 } },
+    { name = "Festive Blessing", ids = { 2652424740 } },
+    { name = "Beesmas Cheer",    ids = { 2652364563 } },
     { name = "Melody",           ids = { 253828517  } },
-    { name = "Bear Morph",       ids = { 1472580249, 1472491940, 2032949183 } },
+    { name = "Bear Morph",       ids = {
+        1472580249, -- Panda Bear Morph
+        1472491940, -- Black Bear Morph
+        2032949183, -- Mother Bear Morph
+        1472425802, -- Brown Bear Morph
+        1489734171, -- Science Bear Morph
+        1472532912, -- Polar Bear Morph
+    } },
     { name = "Red Boost",        ids = { 1442859163 } },
     { name = "Blue Boost",       ids = { 1442863423 } },
     { name = "Baby Love",        ids = { 1472256444 } },
     { name = "Inspire",          ids = { 2000457501 } },
     { name = "Token Link",       ids = { 1629547638 } },
     { name = "Haste",            ids = { 65867881   } },
+    { name = "Summon Frog",      ids = { 4528414666 } },
+    { name = "Surprise Party",   ids = { 8083943936 } },
+    { name = "Inflate Balloon",  ids = { 8083436978 } },
+    { name = "Pollen Haze",      ids = { 4889470194 } },
+    { name = "Fuzz Bomb",        ids = { 4889322534 } },
 }
 
 -- Fast lookup: assetId -> group index
@@ -42,7 +54,12 @@ local SEARCH_FOLDERS       = { "Collectibles", "Tokens" }
 local MIN_TWEEN, MAX_TWEEN = 0.05, 0.50
 local INITIAL_SCAN_DELAY   = 1.0
 local POLL_INTERVAL        = 0.1
-local CONFIG_PATH          = "JellysFarmingScript_config.json"
+
+-- Per-user config file so each account keeps its own presets.
+local function sanitiseFilename(name)
+    return (name:gsub("[^%w_%-%.]", "_"))
+end
+local CONFIG_PATH = "JellysFarmingScript_" .. sanitiseFilename(LocalPlayer.Name) .. ".json"
 
 --=============================================================
 -- STATE
@@ -181,7 +198,6 @@ local gui = new("ScreenGui", {
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 }, PlayerGui)
 
--- Height: title(28) + switch(32) + token header(18+26) + tween(18+16) + padding
 local main = new("Frame", {
     Size = UDim2.fromOffset(240, 194),
     Position = UDim2.new(0, 40, 0, 100),
@@ -296,11 +312,17 @@ local tokenBtnLabel = new("TextLabel", {
     TextXAlignment = Enum.TextXAlignment.Left,
 }, tokenBtn)
 
-local tokenDropdown = new("Frame", {
-    Size = UDim2.new(1, -20, 0, #TOKEN_GROUPS * 24),
+-- Dropdown is scrollable because the list is now taller than the panel.
+local tokenDropdown = new("ScrollingFrame", {
+    Size = UDim2.new(1, -20, 0, 220),
     Position = UDim2.fromOffset(10, 112),
     BackgroundColor3 = Color3.fromRGB(35, 28, 48),
     BorderSizePixel = 0, Visible = false, ZIndex = 5,
+    CanvasSize = UDim2.new(0, 0, 0, #TOKEN_GROUPS * 24),
+    ScrollBarThickness = 4,
+    ScrollBarImageColor3 = Color3.fromRGB(150, 80, 255),
+    AutomaticCanvasSize = Enum.AutomaticSize.None,
+    ScrollingDirection = Enum.ScrollingDirection.Y,
 }, main)
 new("UICorner", { CornerRadius = UDim.new(0, 6) }, tokenDropdown)
 new("UIStroke", { Thickness = 1, Color = Color3.fromRGB(120, 60, 200) }, tokenDropdown)
@@ -399,7 +421,7 @@ refreshTokenBtnLabel()
 -- Checkbox row factory
 local function makeCheckboxRow(parent, yPos, labelText, getSelected, setSelected)
     local item = new("TextButton", {
-        Size = UDim2.new(1, 0, 0, 24),
+        Size = UDim2.new(1, -6, 0, 24),
         Position = UDim2.fromOffset(0, yPos),
         BackgroundTransparency = 1,
         BackgroundColor3 = Color3.fromRGB(150, 80, 255),
@@ -578,7 +600,7 @@ end
 if #scanRoots == 0 then scanRoots = { workspace } end
 
 --=============================================================
--- ELIGIBILITY  (no bounds — just group selection)
+-- ELIGIBILITY
 --=============================================================
 local function isEligible(part, groupIndex)
     if not groupIndex then return false end
@@ -707,8 +729,8 @@ task.spawn(function()
     exclusionsReady = true
     priorityStale = true
 
-    warn(("[Jelly's Farming Script] Ready. Excluded %d initial token(s); roots: %s")
-        :format(#initial, table.concat(
+    warn(("[Jelly's Farming Script] Ready for %s. Excluded %d initial token(s); roots: %s")
+        :format(LocalPlayer.Name, #initial, table.concat(
             (function()
                 local names = {}
                 for _, r in ipairs(scanRoots) do names[#names + 1] = r.Name end

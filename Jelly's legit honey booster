@@ -1,0 +1,783 @@
+--=============================================================
+--  Jelly's Farming Script
+--  LocalScript -> StarterPlayer > StarterPlayerScripts
+--  Unbounded token tweening (no fields) | priority queue | multi-select
+--=============================================================
+
+local Players          = game:GetService("Players")
+local TweenService     = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local HttpService      = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
+
+--=============================================================
+-- CONFIG
+--  Each "group" is a selectable row. A group can map to one or
+--  more asset IDs (e.g. Bear Morph = 3 IDs toggled together).
+--=============================================================
+local TOKEN_GROUPS = {
+    { name = "Festive Blessing", ids = { 2652424756 } },
+    { name = "Beesmas Cheer",    ids = { 2652364571 } },
+    { name = "Melody",           ids = { 253828517  } },
+    { name = "Bear Morph",       ids = { 1472580249, 1472491940, 2032949183 } },
+    { name = "Red Boost",        ids = { 1442859163 } },
+    { name = "Blue Boost",       ids = { 1442863423 } },
+    { name = "Baby Love",        ids = { 1472256444 } },
+    { name = "Inspire",          ids = { 2000457501 } },
+    { name = "Token Link",       ids = { 1629547638 } },
+    { name = "Haste",            ids = { 65867881   } },
+}
+
+-- Fast lookup: assetId -> group index
+local ID_TO_GROUP = {}
+for gi, group in ipairs(TOKEN_GROUPS) do
+    for _, id in ipairs(group.ids) do
+        ID_TO_GROUP[id] = gi
+    end
+end
+
+local SEARCH_FOLDERS       = { "Collectibles", "Tokens" }
+local MIN_TWEEN, MAX_TWEEN = 0.05, 0.50
+local INITIAL_SCAN_DELAY   = 1.0
+local POLL_INTERVAL        = 0.1
+local CONFIG_PATH          = "JellysFarmingScript_config.json"
+
+--=============================================================
+-- STATE
+--=============================================================
+local state = {
+    running   = false,
+    tweenTime = 0.10,
+    minimized = false,
+}
+
+-- Per-group selection (true = allowed). Defaults to all enabled.
+local selectedGroups = {}
+for gi = 1, #TOKEN_GROUPS do
+    selectedGroups[gi] = true
+end
+
+local currentTween    = nil
+local exclusionsReady = false
+
+-- Permanently skipped tokens (initial snapshot + consumed). Weak-keyed.
+local skipTokens = setmetatable({}, { __mode = "k" })
+
+-- Master registry: [BasePart] = groupIndex
+local activeTokens = {}
+
+-- Sorted priority list (closest first)
+local priorityList   = {}
+local priorityStale  = true
+local priorityOrigin = nil
+
+--=============================================================
+-- UTILITIES
+--=============================================================
+local function new(class, props, parent)
+    local inst = Instance.new(class)
+    for k, v in pairs(props) do inst[k] = v end
+    if parent then inst.Parent = parent end
+    return inst
+end
+
+local function assetIdOf(str)
+    if type(str) ~= "string" then return nil end
+    local digits = str:match("%d+")
+    return digits and tonumber(digits) or nil
+end
+
+--=============================================================
+-- TOKEN DETECTION  (returns groupIndex or nil)
+--=============================================================
+local function getTokenGroup(part)
+    if not part or not part:IsA("BasePart") then return nil end
+
+    local function check(id)
+        if not id then return nil end
+        return ID_TO_GROUP[id]
+    end
+
+    if part:IsA("MeshPart") then
+        local g = check(assetIdOf(part.MeshId))
+        if g then return g end
+        g = check(assetIdOf(part.TextureID))
+        if g then return g end
+    end
+    local decal = part:FindFirstChildOfClass("Decal")
+    if decal then
+        local g = check(assetIdOf(decal.Texture)); if g then return g end
+    end
+    local tex = part:FindFirstChildOfClass("Texture")
+    if tex then
+        local g = check(assetIdOf(tex.Texture)); if g then return g end
+    end
+    local sm = part:FindFirstChildOfClass("SpecialMesh")
+    if sm then
+        local g = check(assetIdOf(sm.MeshId)); if g then return g end
+        g = check(assetIdOf(sm.TextureId)); if g then return g end
+    end
+    return nil
+end
+
+--=============================================================
+-- PERSISTENCE
+--=============================================================
+local function canSave()
+    return type(writefile) == "function" and type(readfile) == "function"
+end
+local function fileExists()
+    if type(isfile) == "function" then return isfile(CONFIG_PATH) end
+    return false
+end
+
+local function loadConfig()
+    if not canSave() or not fileExists() then return end
+    local ok, content = pcall(readfile, CONFIG_PATH)
+    if not ok or type(content) ~= "string" then return end
+    local ok2, data = pcall(function() return HttpService:JSONDecode(content) end)
+    if not ok2 or type(data) ~= "table" then return end
+
+    if type(data.enabled) == "boolean" then state.running = data.enabled end
+    if type(data.tweenTime) == "number" then
+        state.tweenTime = math.clamp(data.tweenTime, MIN_TWEEN, MAX_TWEEN)
+    end
+    if type(data.groups) == "table" then
+        for giStr, val in pairs(data.groups) do
+            local gi = tonumber(giStr)
+            if gi and TOKEN_GROUPS[gi] and type(val) == "boolean" then
+                selectedGroups[gi] = val
+            end
+        end
+    end
+end
+
+local function saveConfig()
+    if not canSave() then return end
+    local groupMap = {}
+    for gi, val in pairs(selectedGroups) do
+        groupMap[tostring(gi)] = val
+    end
+    local data = {
+        enabled   = state.running,
+        tweenTime = state.tweenTime,
+        groups    = groupMap,
+    }
+    local ok, encoded = pcall(function() return HttpService:JSONEncode(data) end)
+    if not ok then return end
+    pcall(writefile, CONFIG_PATH, encoded)
+end
+
+loadConfig()
+
+--=============================================================
+-- GUI
+--=============================================================
+local gui = new("ScreenGui", {
+    Name = "JellysFarmingScript",
+    ResetOnSpawn = false,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, PlayerGui)
+
+-- Height: title(28) + switch(32) + token header(18+26) + tween(18+16) + padding
+local main = new("Frame", {
+    Size = UDim2.fromOffset(240, 194),
+    Position = UDim2.new(0, 40, 0, 100),
+    BackgroundColor3 = Color3.fromRGB(24, 20, 32),
+    BorderSizePixel = 0,
+}, gui)
+new("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
+
+local mainStroke = new("UIStroke", {
+    Thickness = 2,
+    Color = Color3.fromRGB(150, 70, 255),
+    ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+}, main)
+local mainGrad = new("UIGradient", {
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0,   Color3.fromRGB(200, 120, 255)),
+        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(110, 40, 220)),
+        ColorSequenceKeypoint.new(1,   Color3.fromRGB(180, 90, 255)),
+    }),
+    Rotation = 0,
+}, mainStroke)
+
+local titleBar = new("Frame", {
+    Size = UDim2.new(1, 0, 0, 28),
+    BackgroundColor3 = Color3.fromRGB(40, 30, 55),
+    BorderSizePixel = 0,
+}, main)
+new("UICorner", { CornerRadius = UDim.new(0, 10) }, titleBar)
+
+new("TextLabel", {
+    Size = UDim2.new(1, -50, 1, 0),
+    Position = UDim2.fromOffset(10, 0),
+    BackgroundTransparency = 1,
+    Text = "Jelly's Farming Script",
+    TextColor3 = Color3.fromRGB(235, 225, 255),
+    TextSize = 13, Font = Enum.Font.GothamBold,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, titleBar)
+
+local minBtn = new("TextButton", {
+    Size = UDim2.fromOffset(22, 22),
+    Position = UDim2.new(1, -26, 0, 3),
+    BackgroundTransparency = 1,
+    Text = "–",
+    TextColor3 = Color3.fromRGB(210, 190, 255),
+    TextSize = 16, Font = Enum.Font.GothamBold,
+    AutoButtonColor = false,
+}, titleBar)
+
+local miniBtn = new("TextButton", {
+    Size = UDim2.fromOffset(44, 44),
+    Position = main.Position,
+    BackgroundColor3 = Color3.fromRGB(40, 30, 55),
+    Text = "JF",
+    TextColor3 = Color3.fromRGB(235, 225, 255),
+    TextSize = 14, Font = Enum.Font.GothamBold,
+    AutoButtonColor = false, BorderSizePixel = 0, Visible = false,
+}, gui)
+new("UICorner", { CornerRadius = UDim.new(1, 0) }, miniBtn)
+local miniStroke = new("UIStroke", {
+    Thickness = 2, Color = Color3.fromRGB(150, 70, 255),
+}, miniBtn)
+local miniGrad = new("UIGradient", { Color = mainGrad.Color, Rotation = 0 }, miniStroke)
+
+-- Main Switch
+new("TextLabel", {
+    Size = UDim2.fromOffset(110, 24),
+    Position = UDim2.fromOffset(10, 36),
+    BackgroundTransparency = 1,
+    Text = "Main Switch",
+    TextColor3 = Color3.fromRGB(215, 205, 240),
+    TextSize = 13, Font = Enum.Font.Gotham,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, main)
+
+local switchBtn = new("TextButton", {
+    Size = UDim2.fromOffset(56, 24),
+    Position = UDim2.new(1, -66, 0, 36),
+    BackgroundColor3 = Color3.fromRGB(60, 50, 80),
+    Text = "OFF",
+    TextColor3 = Color3.fromRGB(235, 225, 255),
+    TextSize = 12, Font = Enum.Font.GothamBold,
+    AutoButtonColor = false, BorderSizePixel = 0,
+}, main)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, switchBtn)
+
+-- Token Select (multi)
+new("TextLabel", {
+    Size = UDim2.new(1, -20, 0, 18),
+    Position = UDim2.fromOffset(10, 68),
+    BackgroundTransparency = 1,
+    Text = "Token Select",
+    TextColor3 = Color3.fromRGB(215, 205, 240),
+    TextSize = 13, Font = Enum.Font.Gotham,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, main)
+
+local tokenBtn = new("TextButton", {
+    Size = UDim2.new(1, -20, 0, 26),
+    Position = UDim2.fromOffset(10, 86),
+    BackgroundColor3 = Color3.fromRGB(55, 45, 75),
+    Text = "", AutoButtonColor = false, BorderSizePixel = 0,
+}, main)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, tokenBtn)
+
+local tokenBtnLabel = new("TextLabel", {
+    Size = UDim2.new(1, -20, 1, 0),
+    Position = UDim2.fromOffset(10, 0),
+    BackgroundTransparency = 1, Text = "",
+    TextColor3 = Color3.fromRGB(235, 225, 255),
+    TextSize = 13, Font = Enum.Font.Gotham,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, tokenBtn)
+
+local tokenDropdown = new("Frame", {
+    Size = UDim2.new(1, -20, 0, #TOKEN_GROUPS * 24),
+    Position = UDim2.fromOffset(10, 112),
+    BackgroundColor3 = Color3.fromRGB(35, 28, 48),
+    BorderSizePixel = 0, Visible = false, ZIndex = 5,
+}, main)
+new("UICorner", { CornerRadius = UDim.new(0, 6) }, tokenDropdown)
+new("UIStroke", { Thickness = 1, Color = Color3.fromRGB(120, 60, 200) }, tokenDropdown)
+
+-- Tween time
+local tweenLabel = new("TextLabel", {
+    Size = UDim2.new(1, -20, 0, 18),
+    Position = UDim2.fromOffset(10, 120),
+    BackgroundTransparency = 1,
+    Text = "Tween Time: 0.10",
+    TextColor3 = Color3.fromRGB(215, 205, 240),
+    TextSize = 13, Font = Enum.Font.Gotham,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, main)
+
+local sliderArea = new("Frame", {
+    Size = UDim2.new(1, -20, 0, 16),
+    Position = UDim2.fromOffset(10, 140),
+    BackgroundTransparency = 1,
+}, main)
+
+local track = new("Frame", {
+    Size = UDim2.new(1, 0, 0, 6),
+    Position = UDim2.new(0, 0, 0.5, 0),
+    AnchorPoint = Vector2.new(0, 0.5),
+    BackgroundColor3 = Color3.fromRGB(55, 45, 75),
+    BorderSizePixel = 0,
+}, sliderArea)
+new("UICorner", { CornerRadius = UDim.new(1, 0) }, track)
+
+local fill = new("Frame", {
+    Size = UDim2.new(0, 0, 1, 0),
+    BackgroundColor3 = Color3.fromRGB(150, 80, 255),
+    BorderSizePixel = 0,
+}, track)
+new("UICorner", { CornerRadius = UDim.new(1, 0) }, fill)
+
+local knob = new("Frame", {
+    Size = UDim2.fromOffset(12, 12),
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.new(0, 0, 0.5, 0),
+    BackgroundColor3 = Color3.fromRGB(240, 230, 255),
+    BorderSizePixel = 0,
+}, sliderArea)
+new("UICorner", { CornerRadius = UDim.new(1, 0) }, knob)
+
+local function refreshSlider()
+    local alpha = (state.tweenTime - MIN_TWEEN) / (MAX_TWEEN - MIN_TWEEN)
+    fill.Size = UDim2.new(alpha, 0, 1, 0)
+    knob.Position = UDim2.new(alpha, 0, 0.5, 0)
+    tweenLabel.Text = string.format("Tween Time: %.2f", state.tweenTime)
+end
+refreshSlider()
+
+local sliding = false
+local function applySliderInput(input)
+    local rel = (input.Position.X - sliderArea.AbsolutePosition.X)
+                / math.max(sliderArea.AbsoluteSize.X, 1)
+    local alpha = math.clamp(rel, 0, 1)
+    local t = MIN_TWEEN + alpha * (MAX_TWEEN - MIN_TWEEN)
+    state.tweenTime = math.floor(t * 100 + 0.5) / 100
+    refreshSlider()
+end
+
+sliderArea.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        sliding = true
+        applySliderInput(input)
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End and sliding then
+                sliding = false
+                saveConfig()
+            end
+        end)
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if sliding and (input.UserInputType == Enum.UserInputType.MouseMovement
+    or input.UserInputType == Enum.UserInputType.Touch) then
+        applySliderInput(input)
+    end
+end)
+
+-- Token count label
+local function refreshTokenBtnLabel()
+    local c = 0
+    for gi = 1, #TOKEN_GROUPS do
+        if selectedGroups[gi] then c = c + 1 end
+    end
+    tokenBtnLabel.Text = string.format("Tokens (%d/%d)   v", c, #TOKEN_GROUPS)
+end
+refreshTokenBtnLabel()
+
+-- Checkbox row factory
+local function makeCheckboxRow(parent, yPos, labelText, getSelected, setSelected)
+    local item = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, 24),
+        Position = UDim2.fromOffset(0, yPos),
+        BackgroundTransparency = 1,
+        BackgroundColor3 = Color3.fromRGB(150, 80, 255),
+        Text = "", AutoButtonColor = false, BorderSizePixel = 0, ZIndex = 6,
+    }, parent)
+
+    local checkBox = new("Frame", {
+        Size = UDim2.fromOffset(14, 14),
+        Position = UDim2.fromOffset(10, 5),
+        BackgroundColor3 = Color3.fromRGB(55, 45, 75),
+        BorderSizePixel = 0, ZIndex = 7,
+    }, item)
+    new("UICorner", { CornerRadius = UDim.new(0, 3) }, checkBox)
+    new("UIStroke", { Color = Color3.fromRGB(120, 60, 200), Thickness = 1 }, checkBox)
+
+    local checkMark = new("TextLabel", {
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1, Text = "✓",
+        TextColor3 = Color3.fromRGB(255, 255, 255),
+        TextSize = 11, Font = Enum.Font.GothamBold,
+        ZIndex = 8, Visible = false,
+    }, checkBox)
+
+    new("TextLabel", {
+        Size = UDim2.new(1, -32, 1, 0),
+        Position = UDim2.fromOffset(32, 0),
+        BackgroundTransparency = 1, Text = labelText,
+        TextColor3 = Color3.fromRGB(225, 215, 245),
+        TextSize = 13, Font = Enum.Font.Gotham,
+        TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 7,
+    }, item)
+
+    local function refresh()
+        if getSelected() then
+            checkBox.BackgroundColor3 = Color3.fromRGB(150, 80, 255)
+            checkMark.Visible = true
+        else
+            checkBox.BackgroundColor3 = Color3.fromRGB(55, 45, 75)
+            checkMark.Visible = false
+        end
+    end
+    refresh()
+
+    item.MouseButton1Click:Connect(function()
+        setSelected(not getSelected())
+        refresh()
+        priorityStale = true
+        saveConfig()
+    end)
+    item.MouseEnter:Connect(function() item.BackgroundTransparency = 0.85 end)
+    item.MouseLeave:Connect(function() item.BackgroundTransparency = 1 end)
+end
+
+for gi, group in ipairs(TOKEN_GROUPS) do
+    makeCheckboxRow(tokenDropdown, (gi - 1) * 24, group.name,
+        function() return selectedGroups[gi] end,
+        function(v) selectedGroups[gi] = v; refreshTokenBtnLabel() end)
+end
+
+tokenBtn.MouseButton1Click:Connect(function()
+    tokenDropdown.Visible = not tokenDropdown.Visible
+end)
+
+-- Minimize
+local function setMinimized(v)
+    state.minimized = v
+    tokenDropdown.Visible = false
+    if v then
+        miniBtn.Position = main.Position
+        main.Visible = false
+        miniBtn.Visible = true
+    else
+        main.Position = miniBtn.Position
+        main.Visible = true
+        miniBtn.Visible = false
+    end
+end
+minBtn.MouseButton1Click:Connect(function() setMinimized(true) end)
+
+-- Mini button: drag-aware restore
+local miniPressPos = nil
+local DRAG_THRESHOLD = 4
+
+miniBtn.MouseButton1Down:Connect(function()
+    miniPressPos = UserInputService:GetMouseLocation()
+end)
+
+miniBtn.MouseButton1Click:Connect(function()
+    if miniPressPos then
+        local delta = (UserInputService:GetMouseLocation() - miniPressPos).Magnitude
+        miniPressPos = nil
+        if delta >= DRAG_THRESHOLD then
+            return
+        end
+    end
+    setMinimized(false)
+end)
+
+-- Drag helper
+local function makeDraggable(handle, target)
+    local dragging, dragStart, startPos
+    handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos  = target.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            target.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+makeDraggable(titleBar, main)
+makeDraggable(miniBtn, miniBtn)
+
+-- Main switch
+local function refreshSwitch()
+    if state.running then
+        switchBtn.Text = "ON"
+        switchBtn.BackgroundColor3 = Color3.fromRGB(90, 200, 120)
+    else
+        switchBtn.Text = "OFF"
+        switchBtn.BackgroundColor3 = Color3.fromRGB(60, 50, 80)
+    end
+end
+refreshSwitch()
+
+switchBtn.MouseButton1Click:Connect(function()
+    state.running = not state.running
+    if not state.running and currentTween then
+        pcall(function() currentTween:Cancel() end)
+        currentTween = nil
+    end
+    refreshSwitch()
+    saveConfig()
+end)
+
+--=============================================================
+-- DYNAMIC PURPLE OUTLINE
+--=============================================================
+task.spawn(function()
+    local t = 0
+    while gui.Parent do
+        local dt = task.wait(0.03)
+        t = t + dt
+        local rot = (t * 90) % 360
+        mainGrad.Rotation = rot
+        miniGrad.Rotation = rot
+        local thick = 2 + math.sin(t * 2.5) * 0.6
+        mainStroke.Thickness = thick
+        miniStroke.Thickness = thick
+    end
+end)
+
+--=============================================================
+-- SCAN ROOTS
+--=============================================================
+local scanRoots = {}
+for _, name in ipairs(SEARCH_FOLDERS) do
+    local f = workspace:FindFirstChild(name)
+    if f then table.insert(scanRoots, f) end
+end
+if #scanRoots == 0 then scanRoots = { workspace } end
+
+--=============================================================
+-- ELIGIBILITY  (no bounds — just group selection)
+--=============================================================
+local function isEligible(part, groupIndex)
+    if not groupIndex then return false end
+    return selectedGroups[groupIndex] == true
+end
+
+--=============================================================
+-- PRIORITY LIST
+--=============================================================
+local SORT_ORIGIN_TOLERANCE = 32
+
+local function buildPriorityList(origin)
+    local list = {}
+    for part, gi in pairs(activeTokens) do
+        if part.Parent
+        and not skipTokens[part]
+        and isEligible(part, gi) then
+            list[#list + 1] = {
+                part = part,
+                dist = (part.Position - origin).Magnitude,
+            }
+        end
+    end
+    table.sort(list, function(a, b) return a.dist < b.dist end)
+    priorityList   = list
+    priorityOrigin = origin
+    priorityStale  = false
+end
+
+local function insertIntoPriorityList(part, gi, origin)
+    if not origin then return end
+    if not isEligible(part, gi) then return end
+
+    local entry = { part = part, dist = (part.Position - origin).Magnitude }
+    local lo, hi = 1, #priorityList + 1
+    while lo < hi do
+        local mid = math.floor((lo + hi) / 2)
+        if priorityList[mid].dist < entry.dist then
+            lo = mid + 1
+        else
+            hi = mid
+        end
+    end
+    table.insert(priorityList, lo, entry)
+end
+
+local function prunePriorityList()
+    while #priorityList > 0 do
+        local entry = priorityList[1]
+        local part = entry.part
+        local gi = activeTokens[part]
+        if not part.Parent
+        or not gi
+        or skipTokens[part]
+        or not isEligible(part, gi) then
+            table.remove(priorityList, 1)
+        else
+            break
+        end
+    end
+end
+
+--=============================================================
+-- TOKEN TRACKING
+--=============================================================
+local function snapshotTargets()
+    local list = {}
+    for _, root in ipairs(scanRoots) do
+        if root.Parent then
+            for _, inst in ipairs(root:GetDescendants()) do
+                if getTokenGroup(inst) then
+                    list[#list + 1] = inst
+                end
+            end
+        end
+    end
+    return list
+end
+
+local function trackPart(part)
+    if not part or not part:IsA("BasePart") then return end
+    if skipTokens[part] or activeTokens[part] then return end
+
+    local gi = getTokenGroup(part)
+    if not gi then return end
+
+    activeTokens[part] = gi
+
+    if priorityOrigin then
+        insertIntoPriorityList(part, gi, priorityOrigin)
+    else
+        priorityStale = true
+    end
+
+    part.AncestryChanged:Connect(function(_, parent)
+        if not parent then
+            activeTokens[part] = nil
+        end
+    end)
+end
+
+local function considerDescendant(desc)
+    trackPart(desc)
+    local parent = desc.Parent
+    if parent and parent:IsA("BasePart") then
+        trackPart(parent)
+    end
+end
+
+--=============================================================
+-- INITIAL EXCLUSION + EVENT HOOKS
+--=============================================================
+task.spawn(function()
+    if not game:IsLoaded() then game.Loaded:Wait() end
+    task.wait(INITIAL_SCAN_DELAY)
+
+    for _, root in ipairs(scanRoots) do
+        root.DescendantAdded:Connect(considerDescendant)
+    end
+
+    local initial = snapshotTargets()
+    for _, part in ipairs(initial) do
+        skipTokens[part] = true
+        activeTokens[part] = nil
+    end
+    exclusionsReady = true
+    priorityStale = true
+
+    warn(("[Jelly's Farming Script] Ready. Excluded %d initial token(s); roots: %s")
+        :format(#initial, table.concat(
+            (function()
+                local names = {}
+                for _, r in ipairs(scanRoots) do names[#names + 1] = r.Name end
+                return names
+            end)(), ", ")))
+end)
+
+--=============================================================
+-- PICK NEXT TARGET
+--=============================================================
+local function pickTarget(origin)
+    if priorityStale
+    or not priorityOrigin
+    or (origin - priorityOrigin).Magnitude > SORT_ORIGIN_TOLERANCE then
+        buildPriorityList(origin)
+    end
+
+    prunePriorityList()
+
+    local entry = priorityList[1]
+    return entry and entry.part or nil
+end
+
+--=============================================================
+-- MAIN LOOP
+--=============================================================
+task.spawn(function()
+    while true do
+        if state.running and exclusionsReady then
+            local char = LocalPlayer.Character
+            local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+            local hum  = char and char:FindFirstChildOfClass("Humanoid")
+
+            if hrp and hum and hum.Health > 0 then
+                local target = pickTarget(hrp.Position)
+
+                if target and target.Parent then
+                    skipTokens[target] = true
+                    activeTokens[target] = nil
+                    if #priorityList > 0 and priorityList[1].part == target then
+                        table.remove(priorityList, 1)
+                    end
+
+                    local dist = (target.Position - hrp.Position).Magnitude
+                    if dist > 0.5 then
+                        local info = TweenInfo.new(
+                            state.tweenTime,
+                            Enum.EasingStyle.Linear,
+                            Enum.EasingDirection.Out
+                        )
+                        local tween = TweenService:Create(hrp, info, {
+                            CFrame = CFrame.new(target.Position)
+                        })
+                        currentTween = tween
+                        tween:Play()
+                        tween.Completed:Wait()
+                        if currentTween == tween then
+                            currentTween = nil
+                        end
+                    end
+                    task.wait(0.05)
+                else
+                    task.wait(POLL_INTERVAL)
+                end
+            else
+                task.wait(0.2)
+            end
+        else
+            task.wait(0.1)
+        end
+    end
+end)
